@@ -1,0 +1,23 @@
+# Virtual environment
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.local
+.env.*.local
+*.db
+.DS_Store
+
+# Build output
+dist/
+build/
+node_modules/
+
+# IDE/project settings
+.vscode/
+.idea/
+
+# OS files
+Thumbs.db
