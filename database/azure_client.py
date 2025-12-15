@@ -32,9 +32,10 @@ try:
     # Validate all required credentials are present
     if all([server, database, username, password]):
         # Build connection string
+        # Simple format that works - let pyodbc handle the tcp: prefix
         conn_str = (
             f"DRIVER={driver};"
-            f"SERVER=tcp:{server},1433;"
+            f"SERVER={server};"
             f"DATABASE={database};"
             f"UID={username};"
             f"PWD={password};"
