@@ -1,6 +1,6 @@
 """
 Azure SQL Database and Blob Storage client configuration.
-Uses ODBC Driver 17 for SQL Server (pre-installed on Azure App Service).
+Uses pymssql (pure Python driver) for SQL Server connectivity.
 Handles missing environment variables gracefully to prevent startup crashes.
 """
 import os
@@ -25,30 +25,22 @@ try:
     username = os.getenv('AZURE_SQL_USERNAME')
     password = os.getenv('AZURE_SQL_PASSWORD')
     
-    # Use ODBC Driver 17 (pre-installed on Azure App Service)
-    # CRITICAL: Don't use Driver 18 - it requires additional configuration
-    driver = '{ODBC Driver 17 for SQL Server}'
-    
     # Validate all required credentials are present
     if all([server, database, username, password]):
-        # Build connection string
-        # Simple format that works - let pyodbc handle the tcp: prefix
-        conn_str = (
-            f"DRIVER={driver};"
-            f"SERVER={server};"
-            f"DATABASE={database};"
-            f"UID={username};"
-            f"PWD={password};"
-            f"Encrypt=yes;"
-            f"TrustServerCertificate=no;"
-            f"Connection Timeout=30;"
-            f"LoginTimeout=30;"
-        )
+        # Store connection parameters for pymssql
+        # pymssql is a pure Python driver - no ODBC dependency needed
+        conn_str = {
+            'server': server,
+            'database': database,
+            'user': username,
+            'password': password,
+            'timeout': 30
+        }
         
         # Test connection
         try:
-            import pyodbc
-            test_conn = pyodbc.connect(conn_str, timeout=5)
+            import pymssql
+            test_conn = pymssql.connect(**conn_str)
             test_conn.close()
             db_available = True
             logger.info("✅ Azure SQL Database connection successful")

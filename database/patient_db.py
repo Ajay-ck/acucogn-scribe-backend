@@ -5,7 +5,7 @@ import time
 import logging
 from datetime import datetime
 from typing import List, Dict, Optional
-import pyodbc
+import pymssql
 import io
 import base64
 import hashlib
@@ -22,6 +22,13 @@ from utils.encryption import (
 )
 
 logger = logging.getLogger("PatientDB")
+
+
+def get_db_connection():
+    """Get a database connection using pymssql with conn_str dictionary"""
+    if not isinstance(conn_str, dict):
+        raise RuntimeError("conn_str must be a dictionary for pymssql")
+    return pymssql.connect(**conn_str)
 
 CONTAINER_NAME = "voice-recordings"
 
@@ -46,7 +53,7 @@ def check_blob_available():
 
 
 def row_to_dict(cursor, row):
-    """Convert pyodbc row to dictionary"""
+    """Convert pymssql row to dictionary"""
     if row is None:
         return None
     columns = [column[0] for column in cursor.description]
@@ -83,7 +90,7 @@ def create_patient(name: str, address: str = '', phone_number: str = '', problem
 
     conn = None
     try:
-        conn = pyodbc.connect(conn_str)
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         query = """
@@ -139,7 +146,7 @@ def get_all_patients(user_id: str = '') -> List[Dict]:
     
     conn = None
     try:
-        conn = pyodbc.connect(conn_str)
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         if user_id:
@@ -182,7 +189,7 @@ def get_patient_by_id(patient_id: int, user_id: str = '') -> Optional[Dict]:
     
     conn = None
     try:
-        conn = pyodbc.connect(conn_str)
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         query = "SELECT TOP 1 * FROM patients WHERE id = ?"
@@ -264,7 +271,7 @@ def save_soap_record(patient_id: int, audio_file_name: str = None, audio_local_p
                 raise Exception(f"Audio upload failed: {upload_error}")
         
         # Save SOAP record to database
-        conn = pyodbc.connect(conn_str)
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         # Store storage_path if uploaded, otherwise store original filename
@@ -344,7 +351,7 @@ def get_patient_soap_records(patient_id: int) -> List[Dict]:
     
     conn = None
     try:
-        conn = pyodbc.connect(conn_str)
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         query = "SELECT * FROM soap_records WHERE patient_id = ? ORDER BY created_at DESC"
@@ -381,7 +388,7 @@ def update_soap_record(record_id: int, soap_sections: Dict) -> bool:
     
     conn = None
     try:
-        conn = pyodbc.connect(conn_str)
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         enc = encrypt_json(soap_sections)
@@ -425,7 +432,7 @@ def save_voice_recording(patient_id: int, soap_record_id: int, file_path: str,
         logger.info(f"Uploaded audio file to Azure Blob Storage: {storage_path}")
         
         # Save metadata to database
-        conn = pyodbc.connect(conn_str)
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         query = """
@@ -462,7 +469,7 @@ def get_voice_recordings(patient_id: int) -> List[Dict]:
     
     conn = None
     try:
-        conn = pyodbc.connect(conn_str)
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         query = "SELECT * FROM voice_recordings WHERE patient_id = ? ORDER BY created_at DESC"
@@ -495,7 +502,7 @@ def create_logged_user(email: str) -> Dict:
     
     conn = None
     try:
-        conn = pyodbc.connect(conn_str)
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         query = """
@@ -536,7 +543,7 @@ def get_logged_user_by_email(email: str) -> Optional[Dict]:
     
     conn = None
     try:
-        conn = pyodbc.connect(conn_str)
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         query = "SELECT TOP 1 * FROM logged_users WHERE email_hash = ?"
