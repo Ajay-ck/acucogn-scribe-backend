@@ -35,7 +35,8 @@ from database.patient_db import (
     create_logged_user,
     get_or_create_logged_user,
 )
-from database.azure_client import blob_service_client
+# Import the availability flags to check if services are ready
+from database.azure_client import blob_service_client, db_available, blob_available
 
 from utils.encryption import decrypt_bytes
 
@@ -70,6 +71,7 @@ app = FastAPI(
 # Support Azure Static Web Apps and other frontend URLs
 allowed_origins = [
     'https://victorious-pond-00c76f410.3.azurestaticapps.net',  # Production frontend URL
+    'https://icy-sky-096f69610.3.azurestaticapps.net',  # Another frontend URL
     'https://acucogn-ambient-scribe-c3hjhdhwd7emeyfn.centralus-01.azurewebsites.net',
     'http://127.0.0.1:5173',
     'http://localhost:5173',
@@ -110,7 +112,7 @@ class FlexibleCORSMiddleware(BaseHTTPMiddleware):
                 response.headers["Access-Control-Allow-Origin"] = origin
                 response.headers["Access-Control-Allow-Credentials"] = "true"
                 response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
-                response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+                response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept"
                 response.headers["Access-Control-Max-Age"] = "3600"
             return response
         
@@ -133,6 +135,27 @@ app.add_middleware(FlexibleCORSMiddleware)
 @app.on_event("startup")
 async def on_startup():
     logger.info("🚀 Backend startup: FastAPI application is initializing.")
+    
+    # Validate critical environment variables
+    from auth.google_auth import GOOGLE_CLIENT_ID, JWT_SECRET_KEY
+    if not GOOGLE_CLIENT_ID:
+        logger.error("❌ GOOGLE_CLIENT_ID is not set in environment variables!")
+    else:
+        logger.info("✅ GOOGLE_CLIENT_ID is configured")
+    
+    if not JWT_SECRET_KEY:
+        logger.error("❌ JWT_SECRET_KEY is not set in environment variables!")
+    else:
+        logger.info("✅ JWT_SECRET_KEY is configured")
+    
+    # Check Azure services availability
+    logger.info(f"✅ CORS configured for {len(allowed_origins)} origin(s)")
+    logger.info(f"✅ Frontend URL: {FRONTEND_URL}")
+    logger.info(f"✅ Cookie settings: Secure={COOKIE_SECURE}, SameSite={COOKIE_SAMESITE}")
+    
+    # Log Azure services status (already logged by azure_client.py but good to confirm)
+    logger.info(f"Azure SQL Database: {'✅ Available' if db_available else '⚠️ Unavailable - check configuration'}")
+    logger.info(f"Azure Blob Storage: {'✅ Available' if blob_available else '⚠️ Unavailable - check configuration'}")
 
 
 @app.on_event("shutdown")
@@ -156,18 +179,30 @@ async def health_check():
     health_status = {
         "status": "healthy",
         "api": "running",
-        "database": "unknown"
+        "database": "unknown",
+        "blob_storage": "unknown"
     }
     
-    # Test database connection
-    try:
-        import pyodbc
-        from database.azure_client import conn_str
-        conn = pyodbc.connect(conn_str, timeout=5)  # Quick 5-second test
-        conn.close()
-        health_status["database"] = "connected"
-    except Exception as e:
-        health_status["database"] = f"error: {str(e)[:100]}"
+    # Check database connection
+    if db_available:
+        try:
+            import pyodbc
+            from database.azure_client import conn_str
+            conn = pyodbc.connect(conn_str, timeout=5)  # Quick 5-second test
+            conn.close()
+            health_status["database"] = "connected"
+        except Exception as e:
+            health_status["database"] = f"error: {str(e)[:100]}"
+            health_status["status"] = "degraded"
+    else:
+        health_status["database"] = "not_configured"
+        health_status["status"] = "degraded"
+    
+    # Check blob storage
+    if blob_available:
+        health_status["blob_storage"] = "available"
+    else:
+        health_status["blob_storage"] = "not_configured"
         health_status["status"] = "degraded"
     
     return health_status
@@ -186,7 +221,6 @@ async def process_audio_api(
     
     overall_start = time.time()
     
-    
     session_id = set_session_id(session_id or str(uuid.uuid4())[:8])
     logger.info(f"[{session_id}] ▶️ Process audio START. Filename: {audio.filename}, Patient ID: {patient_id}")
 
@@ -198,9 +232,7 @@ async def process_audio_api(
         logger.error(f"[{session_id}] No audio file provided.")
         raise HTTPException(status_code=400, detail="No audio file provided.")
 
-    
     try:
-        
         file_save_start = time.time()
         with tempfile.NamedTemporaryFile(delete=False, dir=UPLOAD_FOLDER, suffix=os.path.splitext(audio.filename)[1]) as temp_audio_file:
             contents = await audio.read()
@@ -209,7 +241,6 @@ async def process_audio_api(
         file_save_time = time.time() - file_save_start
         logger.info(f"[{session_id}] 📁 Audio file saved to {filepath} (Time: {file_save_time:.2f}s)")
 
-        
         logger.info(f"[{session_id}] 🎙️ Starting transcription with Deepgram...")
         transcription_start = time.time()
         transcript, diarized_segments = processor.transcribe_file(filepath)
@@ -220,7 +251,6 @@ async def process_audio_api(
             raise HTTPException(status_code=500, detail="Failed to transcribe audio.")
         logger.info(f"[{session_id}] ✅ Transcription completed. Transcript length: {len(transcript)} chars (Time: {transcription_time:.2f}s)")
 
-        
         corrected_transcript = transcript
         is_realtime_flag = is_realtime and is_realtime.lower() == "true"
         correction_time = 0
@@ -246,9 +276,7 @@ async def process_audio_api(
         soap_sections = gemini_summary_raw
         logger.info(f"[{session_id}] 🧴 SOAP sections created: {list(soap_sections.keys()) if isinstance(soap_sections, dict) else 'unknown'} (Time: {soap_time:.2f}s)")
 
-    
         total_time = time.time() - overall_start
-        
         
         logger.info(f"[{session_id}] ⏱️ TIMING SUMMARY:")
         logger.info(f"[{session_id}]   • File Save: {file_save_time:.2f}s")
@@ -273,10 +301,8 @@ async def process_audio_api(
             }
         }
         
-        
         if patient_id:
             try:
-                
                 soap_record = save_soap_record(
                     patient_id=patient_id,
                     audio_file_name=audio.filename,
@@ -289,7 +315,8 @@ async def process_audio_api(
                 logger.info(f"[{session_id}] ✅ SOAP record saved to database with ID: {soap_record['id']}")
             except Exception as db_error:
                 logger.error(f"[{session_id}] Warning: Failed to save SOAP record to database: {db_error}")
-                
+                # Don't fail the request - return the data anyway
+                response_data["warning"] = "SOAP record could not be saved to database"
         
         logger.info(f"[{session_id}] ⏹️ Process audio END. Success; sending response.")
         return JSONResponse(content=response_data, status_code=200)
@@ -298,7 +325,6 @@ async def process_audio_api(
         logger.error(f"[{session_id}] Error during audio processing: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
     finally:
-        
         if 'filepath' in locals() and os.path.exists(filepath):
             os.remove(filepath)
             logger.info(f"[{session_id}] Cleaned up temporary audio file: {filepath}")
@@ -328,12 +354,6 @@ async def approve_plan_api(payload: dict):
 
     results = {}
     try:
-        # Process Medicines (disabled)
-        # logger.info(f"[{session_id}] Processing medicines...")
-        # medicine_res = process_medicines(plan_section)
-        # results['medicine_processing'] = medicine_res
-
-        # Process Appointment - Generate content first (send_email flag controls sending)
         logger.info(f"[{session_id}] Generating appointment email content...")
         preview_start = time.time()
         appointment_preview_res = process_appointment(plan_section, user_email, send_email=False)
@@ -345,7 +365,6 @@ async def approve_plan_api(payload: dict):
 
         if appointment_preview_res["status"] == "success" and "email_content" in appointment_preview_res:
             if send_email:
-                
                 if custom_email_content:
                     logger.info(f"[{session_id}] Sending appointment email with custom (edited) content...")
                 else:
@@ -369,7 +388,6 @@ async def approve_plan_api(payload: dict):
                     logger.info(f"[{session_id}] Plan approved and actions executed successfully.")
                     return JSONResponse(content=results, status_code=200)
                 else:
-                    # Email sending failed - return error status to frontend
                     error_message = appointment_send_res.get('error', 'Unknown email sending error')
                     logger.error(f"[{session_id}] ❌ Appointment email sending FAILED: {error_message}")
                     results['message'] = f"Failed to send email: {error_message}"
@@ -429,7 +447,6 @@ async def user_chat_api(payload: dict):
         )
 
     try:
-        
         processing_start = time.time()
         result = process_user_question(question, soap_summary)
         processing_time = time.time() - processing_start
@@ -493,7 +510,6 @@ async def create_patient_api(payload: dict, user: dict = Depends(get_current_use
         )
 
     try:
-        
         logged = get_logged_user_by_email(user['email'])
         if not logged:
             logger.info(f"[{session_id}] Logged user not found for email: {user.get('email')}; creating user record")
@@ -609,62 +625,70 @@ async def get_patient_api(patient_id: int, user: dict = Depends(get_current_user
 
 
 @app.post("/auth/google")
-async def google_auth(payload: dict, response: Response):  
+async def google_auth(payload: dict, response: Response, request: Request):  
     """
     Verify Google OAuth token and set JWT token in HTTP-only cookie.
     Expects: {"token": "google_oauth_token"}
     """
     session_id = set_session_id(str(uuid.uuid4())[:8])
-    logger.info(f"[{session_id}] Google authentication attempt")
+    origin = request.headers.get("origin", "unknown")
+    logger.info(f"[{session_id}] Google authentication attempt from origin: {origin}")
     
-    google_token = payload.get('token')
-    if not google_token:
-        raise HTTPException(status_code=400, detail="Google token is required")
-    
-    
-    user_data = verify_google_token(google_token)
-    if not user_data:
-        raise HTTPException(status_code=401, detail="Invalid Google token")
-    
-    
-    jwt_token = create_jwt_token(user_data)
-    
-    
-    logger.info(f"[{session_id}] Google authentication succeeded for a user (PII omitted)")
+    try:
+        google_token = payload.get('token')
+        if not google_token:
+            logger.warning(f"[{session_id}] Google authentication failed: token missing")
+            raise HTTPException(status_code=400, detail="Google token is required")
+        
+        user_data = verify_google_token(google_token)
+        if not user_data:
+            logger.warning(f"[{session_id}] Google authentication failed: invalid token")
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+        
+        jwt_token = create_jwt_token(user_data)
+        if not jwt_token:
+            logger.error(f"[{session_id}] Google authentication failed: JWT creation failed")
+            raise HTTPException(status_code=500, detail="Failed to create authentication token")
+        
+        logger.info(f"[{session_id}] Google authentication succeeded for a user (PII omitted)")
 
-    
-    resp = JSONResponse(
-        content={
-            "status": "success",
-            "user": {
-                "email": user_data['email'],
-                "name": user_data['name'],
-                "picture": user_data['picture']
+        resp = JSONResponse(
+            content={
+                "status": "success",
+                "user": {
+                    "email": user_data['email'],
+                    "name": user_data['name'],
+                    "picture": user_data['picture']
+                }
             }
-        }
-    )
+        )
 
-    resp.set_cookie(
-        key="auth_token",
-        value=jwt_token,
-        httponly=True,
-        secure=COOKIE_SECURE,
-        samesite=COOKIE_SAMESITE,
-        max_age=86400,      
-        path='/'
-    )
+        resp.set_cookie(
+            key="auth_token",
+            value=jwt_token,
+            httponly=True,
+            secure=COOKIE_SECURE,
+            samesite=COOKIE_SAMESITE,
+            max_age=86400,      
+            path='/'
+        )
 
-    
-    logger.info(f"[{session_id}] auth cookie set on response (HttpOnly=True, Secure={COOKIE_SECURE}, SameSite={COOKIE_SAMESITE})")
+        logger.info(f"[{session_id}] auth cookie set on response (HttpOnly=True, Secure={COOKIE_SECURE}, SameSite={COOKIE_SAMESITE})")
 
-    # Don't wait for database call - do it in background
-    # This prevents blocking the login response
-    import asyncio
-    asyncio.create_task(log_user_to_db_async(user_data['email']))
-    
-    logger.info(f"[{session_id}] User authenticated Successfully (login flow complete)")
+        # Don't wait for database call - do it in background
+        # This prevents blocking the login response
+        import asyncio
+        asyncio.create_task(log_user_to_db_async(user_data['email']))
+        
+        logger.info(f"[{session_id}] User authenticated Successfully (login flow complete)")
 
-    return resp
+        return resp
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[{session_id}] Google authentication error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Authentication error: {str(e)}")
+
 @app.get("/auth/verify")
 async def verify_auth(user: dict = Depends(get_current_user)):
     """
@@ -706,7 +730,6 @@ async def logout(request: Request, response: Response):
         path='/'
     )
 
-    
     logger.info(f"[{session_id}] Auth cookie deleted from response (logout) — no PII logged")
 
     return JSONResponse(content={"status": "success", "message": "Logged out"}, status_code=200)
@@ -719,7 +742,6 @@ async def get_patient_soap_records_api(patient_id: int, user: dict = Depends(get
     Returns a list of all medical notes with transcripts for the patient.
     """
     try:
-        
         logged = get_logged_user_by_email(user['email'])
         patient = get_patient_by_id(patient_id, user_id=logged['id'])
         if not patient:
@@ -734,13 +756,11 @@ async def get_patient_soap_records_api(patient_id: int, user: dict = Depends(get
         records = get_patient_soap_records(patient_id)
         voice_recordings = get_voice_recordings(patient_id)
         
-        
         voice_recording_map = {}
         for vr in voice_recordings:
             soap_record_id = vr.get('soap_record_id')
             if soap_record_id:
                 voice_recording_map[soap_record_id] = vr.get('storage_path')
-        
         
         formatted_records = []
         for record in records:
@@ -839,11 +859,14 @@ async def download_audio(request: Request, storage_path: str):
     session_id = set_session_id(str(uuid.uuid4())[:8])
     logger.info(f"[{session_id}] 🎵 Download audio request for: {storage_path}")
     
+    # Check if blob storage is available
+    if not blob_available:
+        logger.error(f"[{session_id}] ❌ Blob storage not configured")
+        raise HTTPException(status_code=503, detail="Blob storage is not configured. Please configure AZURE_STORAGE_CONNECTION_STRING.")
+    
     try:
-        
         container_name = os.getenv('AZURE_STORAGE_CONTAINER', 'voice-recordings')
         logger.info(f"[{session_id}] 📦 Attempting to download from container: {container_name}")
-        
         
         try:
             blob_client = blob_service_client.get_blob_client(
@@ -857,7 +880,6 @@ async def download_audio(request: Request, storage_path: str):
             logger.error(f"[{session_id}] ❌ Azure Blob download failed: {download_error}")
             raise HTTPException(status_code=404, detail=f"File not found in storage: {storage_path}")
 
-        
         logger.info(f"[{session_id}] 🔓 Starting decryption...")
         enc_b64 = base64.b64encode(enc_raw).decode('utf-8')
         
@@ -868,7 +890,6 @@ async def download_audio(request: Request, storage_path: str):
             logger.error(f"[{session_id}] ❌ Decryption failed: {decrypt_error}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Failed to decrypt audio: {str(decrypt_error)}")
 
-        
         mime_type, _ = mimetypes.guess_type(storage_path)
         if not mime_type:
             mime_type = 'audio/wav'  
@@ -876,7 +897,6 @@ async def download_audio(request: Request, storage_path: str):
         else:
             logger.info(f"[{session_id}] 📄 Detected mime type: {mime_type}")
 
-        
         total = len(plaintext)
         range_header = request.headers.get('range')
         
@@ -893,7 +913,6 @@ async def download_audio(request: Request, storage_path: str):
                 start = 0
                 end = total - 1
 
-            
             if start < 0: start = 0
             if end >= total: end = total - 1
             if start > end:
@@ -912,7 +931,6 @@ async def download_audio(request: Request, storage_path: str):
             logger.info(f"[{session_id}] 📤 Sending partial content: bytes {start}-{end}/{total}")
             return StreamingResponse(io.BytesIO(chunk), status_code=206, media_type=mime_type, headers=headers)
 
-        
         logger.info(f"[{session_id}] 📤 Sending full content: {total} bytes")
         headers = {
             'Accept-Ranges': 'bytes',
@@ -928,3 +946,10 @@ async def download_audio(request: Request, storage_path: str):
     except Exception as e:
         logger.error(f"[{session_id}] ❌ Unexpected error in download_audio: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+# For local testing
+if __name__ == "__main__":
+    import uvicorn
+    PORT = int(os.getenv('PORT', 8000))
+    uvicorn.run("app:app", host="0.0.0.0", port=PORT, reload=True)

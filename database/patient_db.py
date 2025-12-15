@@ -1,4 +1,3 @@
-
 import os
 import uuid
 import json
@@ -12,7 +11,7 @@ import base64
 import hashlib
 from azure.storage.blob import BlobServiceClient
 
-from database.azure_client import conn_str, blob_service_client
+from database.azure_client import conn_str, blob_service_client, db_available, blob_available
 from utils.encryption import (
     encrypt_text,
     decrypt_text,
@@ -25,6 +24,25 @@ from utils.encryption import (
 logger = logging.getLogger("PatientDB")
 
 CONTAINER_NAME = "voice-recordings"
+
+
+def check_db_available():
+    """Check if database is available, raise exception if not."""
+    if not db_available or not conn_str:
+        raise RuntimeError(
+            "Azure SQL Database is not available. "
+            "Please configure: AZURE_SQL_SERVER, AZURE_SQL_DATABASE, "
+            "AZURE_SQL_USERNAME, AZURE_SQL_PASSWORD"
+        )
+
+
+def check_blob_available():
+    """Check if blob storage is available, raise exception if not."""
+    if not blob_available or not blob_service_client:
+        raise RuntimeError(
+            "Azure Blob Storage is not available. "
+            "Please configure: AZURE_STORAGE_CONNECTION_STRING"
+        )
 
 
 def row_to_dict(cursor, row):
@@ -58,6 +76,8 @@ def create_patient(name: str, address: str = '', phone_number: str = '', problem
 
     Note: `user_id` is required to associate patients with a logged user.
     """
+    check_db_available()  # Check before attempting connection
+    
     if not user_id:
         raise ValueError('user_id is required to create a patient')
 
@@ -65,7 +85,6 @@ def create_patient(name: str, address: str = '', phone_number: str = '', problem
     try:
         conn = pyodbc.connect(conn_str)
         cursor = conn.cursor()
-        
         
         query = """
             INSERT INTO patients (user_id, name, address, phone_number, problem)
@@ -87,7 +106,6 @@ def create_patient(name: str, address: str = '', phone_number: str = '', problem
         new_id = result[0]
         conn.commit()
         
-        
         cursor.execute("SELECT * FROM patients WHERE id = ?", (new_id,))
         row = cursor.fetchone()
         patient = row_to_dict(cursor, row)
@@ -97,12 +115,11 @@ def create_patient(name: str, address: str = '', phone_number: str = '', problem
         if patient is None:
             raise Exception(f"Patient record not found after insertion with ID: {new_id}")
         
-        
+        # Decrypt sensitive fields
         patient['name'] = decrypt_text(patient['name'])
         patient['address'] = decrypt_text(patient['address'])
         patient['phone_number'] = decrypt_text(patient['phone_number'])
         patient['problem'] = decrypt_text(patient['problem'])
-        
         
         convert_datetime_fields(patient)
         
@@ -118,6 +135,8 @@ def create_patient(name: str, address: str = '', phone_number: str = '', problem
 
 
 def get_all_patients(user_id: str = '') -> List[Dict]:
+    check_db_available()
+    
     conn = None
     try:
         conn = pyodbc.connect(conn_str)
@@ -133,7 +152,7 @@ def get_all_patients(user_id: str = '') -> List[Dict]:
         rows = cursor.fetchall()
         patients = [row_to_dict(cursor, row) for row in rows]
         
-        
+        # Decrypt patient fields
         for patient in patients:
             try:
                 if patient.get('name'):
@@ -159,6 +178,8 @@ def get_all_patients(user_id: str = '') -> List[Dict]:
 
 
 def get_patient_by_id(patient_id: int, user_id: str = '') -> Optional[Dict]:
+    check_db_available()
+    
     conn = None
     try:
         conn = pyodbc.connect(conn_str)
@@ -173,12 +194,12 @@ def get_patient_by_id(patient_id: int, user_id: str = '') -> Optional[Dict]:
         
         patient = row_to_dict(cursor, row)
         
-        
+        # Check ownership
         if user_id and patient.get('user_id') != user_id:
             logger.warning(f"User {user_id} attempted to access patient {patient_id} belonging to {patient.get('user_id')}")
             return None
         
-        
+        # Decrypt patient fields
         try:
             if patient.get('name'):
                 patient['name'] = decrypt_text(patient['name'])
@@ -202,7 +223,6 @@ def get_patient_by_id(patient_id: int, user_id: str = '') -> Optional[Dict]:
             conn.close()
 
 
-
 def save_soap_record(patient_id: int, audio_file_name: str = None, audio_local_path: str = None,
                      transcript: str = '', original_transcript: Optional[str] = None,
                      soap_sections: Optional[Dict] = None) -> Dict:
@@ -210,12 +230,16 @@ def save_soap_record(patient_id: int, audio_file_name: str = None, audio_local_p
 
     Returns inserted record dict (including id) and storage_path if uploaded.
     """
+    check_db_available()
+    
     storage_path = None
     conn = None
     
     try:
-        
+        # Upload audio to Azure Blob Storage if provided
         if audio_local_path and os.path.exists(audio_local_path):
+            check_blob_available()  # Check blob storage is available
+            
             timestamp = int(time.time())
             filename = audio_file_name or os.path.basename(audio_local_path)
             storage_path = f"{patient_id}/{timestamp}_{filename}"
@@ -224,11 +248,11 @@ def save_soap_record(patient_id: int, audio_file_name: str = None, audio_local_p
                 raw = f.read()
             
             try:
-                
+                # Encrypt audio data
                 enc_b64 = encrypt_bytes(raw)
                 enc_bytes = base64.b64decode(enc_b64)
                 
-                
+                # Upload to Azure Blob Storage
                 blob_client = blob_service_client.get_blob_client(
                     container=CONTAINER_NAME,
                     blob=storage_path
@@ -239,11 +263,11 @@ def save_soap_record(patient_id: int, audio_file_name: str = None, audio_local_p
                 logger.exception('Failed to encrypt/upload audio file')
                 raise Exception(f"Audio upload failed: {upload_error}")
         
-        
+        # Save SOAP record to database
         conn = pyodbc.connect(conn_str)
         cursor = conn.cursor()
         
-        
+        # Store storage_path if uploaded, otherwise store original filename
         audio_file_to_store = storage_path if storage_path else audio_file_name
         
         query = """
@@ -266,7 +290,7 @@ def save_soap_record(patient_id: int, audio_file_name: str = None, audio_local_p
         record_id = result[0]
         conn.commit()
         
-        
+        # Retrieve the inserted record
         cursor.execute("SELECT * FROM soap_records WHERE id = ?", (record_id,))
         row = cursor.fetchone()
         record = row_to_dict(cursor, row)
@@ -274,7 +298,7 @@ def save_soap_record(patient_id: int, audio_file_name: str = None, audio_local_p
         if not record:
             raise Exception('Failed to retrieve inserted soap record')
         
-        
+        # Also create voice_recordings entry if audio was uploaded
         if storage_path:
             voice_query = """
                 INSERT INTO voice_recordings (patient_id, soap_record_id, storage_path, file_name, is_realtime)
@@ -291,7 +315,7 @@ def save_soap_record(patient_id: int, audio_file_name: str = None, audio_local_p
         
         record['storage_path'] = storage_path
         
-        
+        # Decrypt fields before returning
         try:
             if record.get('transcript'):
                 record['transcript'] = decrypt_text(record['transcript'])
@@ -301,7 +325,6 @@ def save_soap_record(patient_id: int, audio_file_name: str = None, audio_local_p
                 record['soap_sections'] = decrypt_json(record['soap_sections'])
         except Exception:
             logger.exception('Failed to decrypt soap record')
-        
         
         convert_datetime_fields(record)
         
@@ -317,6 +340,8 @@ def save_soap_record(patient_id: int, audio_file_name: str = None, audio_local_p
 
 
 def get_patient_soap_records(patient_id: int) -> List[Dict]:
+    check_db_available()
+    
     conn = None
     try:
         conn = pyodbc.connect(conn_str)
@@ -328,7 +353,7 @@ def get_patient_soap_records(patient_id: int) -> List[Dict]:
         rows = cursor.fetchall()
         records = [row_to_dict(cursor, row) for row in rows]
         
-        
+        # Decrypt fields
         for record in records:
             try:
                 if record.get('transcript'):
@@ -351,9 +376,9 @@ def get_patient_soap_records(patient_id: int) -> List[Dict]:
             conn.close()
 
 
-
-
 def update_soap_record(record_id: int, soap_sections: Dict) -> bool:
+    check_db_available()
+    
     conn = None
     try:
         conn = pyodbc.connect(conn_str)
@@ -377,12 +402,15 @@ def update_soap_record(record_id: int, soap_sections: Dict) -> bool:
 
 def save_voice_recording(patient_id: int, soap_record_id: int, file_path: str,
                          file_name: str, is_realtime: bool = False) -> Dict:
+    check_db_available()
+    check_blob_available()
+    
     timestamp = int(time.time())
     storage_path = f"{patient_id}/{timestamp}_{file_name}"
     conn = None
     
     try:
-        
+        # Upload encrypted audio to blob storage
         with open(file_path, 'rb') as f:
             raw = f.read()
         
@@ -396,7 +424,7 @@ def save_voice_recording(patient_id: int, soap_record_id: int, file_path: str,
         blob_client.upload_blob(enc_bytes, overwrite=True)
         logger.info(f"Uploaded audio file to Azure Blob Storage: {storage_path}")
         
-    
+        # Save metadata to database
         conn = pyodbc.connect(conn_str)
         cursor = conn.cursor()
         
@@ -407,15 +435,14 @@ def save_voice_recording(patient_id: int, soap_record_id: int, file_path: str,
         cursor.execute(query, (patient_id, soap_record_id, storage_path, file_name, is_realtime))
         conn.commit()
         
-        
+        # Get the inserted ID
         cursor.execute("SELECT SCOPE_IDENTITY()")
         recording_id = cursor.fetchone()[0]
         
-        
+        # Retrieve the full record
         cursor.execute("SELECT * FROM voice_recordings WHERE id = ?", (recording_id,))
         row = cursor.fetchone()
         recording = row_to_dict(cursor, row)
-        
         
         convert_datetime_fields(recording)
         
@@ -431,6 +458,8 @@ def save_voice_recording(patient_id: int, soap_record_id: int, file_path: str,
 
 
 def get_voice_recordings(patient_id: int) -> List[Dict]:
+    check_db_available()
+    
     conn = None
     try:
         conn = pyodbc.connect(conn_str)
@@ -442,7 +471,7 @@ def get_voice_recordings(patient_id: int) -> List[Dict]:
         rows = cursor.fetchall()
         recordings = [row_to_dict(cursor, row) for row in rows]
         
-    
+        # Convert datetime fields
         for recording in recordings:
             convert_datetime_fields(recording)
         
@@ -457,6 +486,8 @@ def get_voice_recordings(patient_id: int) -> List[Dict]:
 
 def create_logged_user(email: str) -> Dict:
     """Create a logged user record storing an encrypted email and returning the generated user id."""
+    check_db_available()
+    
     user_id = generate_user_id()
     
     email_norm = (email or '').strip().lower()
@@ -476,12 +507,12 @@ def create_logged_user(email: str) -> Dict:
         
         logger.info(f"Logged user created with id: {user_id}")
         
-        
+        # Retrieve the created user
         cursor.execute("SELECT * FROM logged_users WHERE id = ?", (user_id,))
         row = cursor.fetchone()
         user = row_to_dict(cursor, row)
         
-        
+        # Decrypt email
         if user and user.get('email'):
             user['email'] = decrypt_text(user['email'])
         
@@ -496,9 +527,10 @@ def create_logged_user(email: str) -> Dict:
             conn.close()
 
 
-
 def get_logged_user_by_email(email: str) -> Optional[Dict]:
     """Lookup logged user by deterministic email hash (case-insensitive)."""
+    check_db_available()
+    
     email_norm = (email or '').strip().lower()
     email_hash = hashlib.sha256(email_norm.encode('utf-8')).hexdigest()
     
@@ -516,7 +548,7 @@ def get_logged_user_by_email(email: str) -> Optional[Dict]:
         
         user = row_to_dict(cursor, row)
         
-        
+        # Decrypt email
         try:
             if user.get('email'):
                 user['email'] = decrypt_text(user['email'])
