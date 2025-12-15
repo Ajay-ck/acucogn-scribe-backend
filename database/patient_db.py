@@ -1,3 +1,7 @@
+"""
+Patient database operations using pyodbc for Azure SQL.
+Supports both Managed Identity and SQL Authentication.
+"""
 import os
 import uuid
 import json
@@ -5,13 +9,13 @@ import time
 import logging
 from datetime import datetime
 from typing import List, Dict, Optional
-import pymssql
+import pyodbc
 import io
 import base64
 import hashlib
 from azure.storage.blob import BlobServiceClient
 
-from database.azure_client import conn_str, blob_service_client, db_available, blob_available
+from database.azure_client import connection_string, blob_service_client, db_available, blob_available, use_managed_identity, get_db_connection
 from utils.encryption import (
     encrypt_text,
     decrypt_text,
@@ -23,23 +27,15 @@ from utils.encryption import (
 
 logger = logging.getLogger("PatientDB")
 
-
-def get_db_connection():
-    """Get a database connection using pymssql with conn_str dictionary"""
-    if not isinstance(conn_str, dict):
-        raise RuntimeError("conn_str must be a dictionary for pymssql")
-    return pymssql.connect(**conn_str)
-
 CONTAINER_NAME = "voice-recordings"
 
 
 def check_db_available():
     """Check if database is available, raise exception if not."""
-    if not db_available or not conn_str:
+    if not db_available:
         raise RuntimeError(
             "Azure SQL Database is not available. "
-            "Please configure: AZURE_SQL_SERVER, AZURE_SQL_DATABASE, "
-            "AZURE_SQL_USERNAME, AZURE_SQL_PASSWORD"
+            "Check configuration and ensure Managed Identity or SQL credentials are set."
         )
 
 
@@ -48,12 +44,12 @@ def check_blob_available():
     if not blob_available or not blob_service_client:
         raise RuntimeError(
             "Azure Blob Storage is not available. "
-            "Please configure: AZURE_STORAGE_CONNECTION_STRING"
+            "Please configure AZURE_STORAGE_CONNECTION_STRING or AZURE_STORAGE_ACCOUNT_URL."
         )
 
 
 def row_to_dict(cursor, row):
-    """Convert pymssql row to dictionary"""
+    """Convert pyodbc row to dictionary"""
     if row is None:
         return None
     columns = [column[0] for column in cursor.description]
@@ -69,7 +65,7 @@ def generate_user_id() -> str:
 
 
 def convert_datetime_fields(data: Dict) -> Dict:
-    """Convert datetime objects to ISO format strings for JSON serialization"""
+    """Convert datetime objects to ISO format strings"""
     if data is None:
         return data
     for key in data:
@@ -79,11 +75,8 @@ def convert_datetime_fields(data: Dict) -> Dict:
 
 
 def create_patient(name: str, address: str = '', phone_number: str = '', problem: str = '', user_id: str = '') -> Dict:
-    """Create a patient linked to a logged user by `user_id`.
-
-    Note: `user_id` is required to associate patients with a logged user.
-    """
-    check_db_available()  # Check before attempting connection
+    """Create a patient linked to a logged user."""
+    check_db_available()
     
     if not user_id:
         raise ValueError('user_id is required to create a patient')
@@ -120,7 +113,7 @@ def create_patient(name: str, address: str = '', phone_number: str = '', problem
         logger.info(f"Patient created for user_id: {user_id}, patient_id: {new_id}")
         
         if patient is None:
-            raise Exception(f"Patient record not found after insertion with ID: {new_id}")
+            raise Exception(f"Patient record not found after insertion")
         
         # Decrypt sensitive fields
         patient['name'] = decrypt_text(patient['name'])
@@ -132,7 +125,7 @@ def create_patient(name: str, address: str = '', phone_number: str = '', problem
         
         return patient
     except Exception as e:
-        logger.error(f"Azure create_patient error: {e}")
+        logger.error(f"create_patient error: {e}")
         if conn:
             conn.rollback()
         raise Exception(f"Failed to create patient: {e}")
@@ -142,6 +135,7 @@ def create_patient(name: str, address: str = '', phone_number: str = '', problem
 
 
 def get_all_patients(user_id: str = '') -> List[Dict]:
+    """Get all patients for a user."""
     check_db_available()
     
     conn = None
@@ -177,7 +171,7 @@ def get_all_patients(user_id: str = '') -> List[Dict]:
         
         return patients
     except Exception as e:
-        logger.error(f"Azure get_all_patients error: {e}")
+        logger.error(f"get_all_patients error: {e}")
         raise Exception(f"Failed to get patients: {e}")
     finally:
         if conn:
@@ -185,6 +179,7 @@ def get_all_patients(user_id: str = '') -> List[Dict]:
 
 
 def get_patient_by_id(patient_id: int, user_id: str = '') -> Optional[Dict]:
+    """Get a patient by ID."""
     check_db_available()
     
     conn = None
@@ -203,7 +198,7 @@ def get_patient_by_id(patient_id: int, user_id: str = '') -> Optional[Dict]:
         
         # Check ownership
         if user_id and patient.get('user_id') != user_id:
-            logger.warning(f"User {user_id} attempted to access patient {patient_id} belonging to {patient.get('user_id')}")
+            logger.warning(f"Access denied: user {user_id} tried to access patient {patient_id}")
             return None
         
         # Decrypt patient fields
@@ -223,7 +218,7 @@ def get_patient_by_id(patient_id: int, user_id: str = '') -> Optional[Dict]:
         
         return patient
     except Exception as e:
-        logger.error(f"Azure get_patient_by_id error: {e}")
+        logger.error(f"get_patient_by_id error: {e}")
         raise Exception(f"Failed to get patient: {e}")
     finally:
         if conn:
@@ -233,10 +228,7 @@ def get_patient_by_id(patient_id: int, user_id: str = '') -> Optional[Dict]:
 def save_soap_record(patient_id: int, audio_file_name: str = None, audio_local_path: str = None,
                      transcript: str = '', original_transcript: Optional[str] = None,
                      soap_sections: Optional[Dict] = None) -> Dict:
-    """Save a SOAP record linked to `patient_id` and optionally upload audio to Azure Blob Storage.
-
-    Returns inserted record dict (including id) and storage_path if uploaded.
-    """
+    """Save a SOAP record and optionally upload audio to Azure Blob Storage."""
     check_db_available()
     
     storage_path = None
@@ -245,7 +237,7 @@ def save_soap_record(patient_id: int, audio_file_name: str = None, audio_local_p
     try:
         # Upload audio to Azure Blob Storage if provided
         if audio_local_path and os.path.exists(audio_local_path):
-            check_blob_available()  # Check blob storage is available
+            check_blob_available()
             
             timestamp = int(time.time())
             filename = audio_file_name or os.path.basename(audio_local_path)
@@ -265,16 +257,15 @@ def save_soap_record(patient_id: int, audio_file_name: str = None, audio_local_p
                     blob=storage_path
                 )
                 blob_client.upload_blob(enc_bytes, overwrite=True)
-                logger.info(f"Uploaded audio file to Azure Blob Storage: {storage_path}")
+                logger.info(f"Uploaded audio to Blob Storage: {storage_path}")
             except Exception as upload_error:
-                logger.exception('Failed to encrypt/upload audio file')
+                logger.exception('Failed to encrypt/upload audio')
                 raise Exception(f"Audio upload failed: {upload_error}")
         
         # Save SOAP record to database
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Store storage_path if uploaded, otherwise store original filename
         audio_file_to_store = storage_path if storage_path else audio_file_name
         
         query = """
@@ -305,7 +296,7 @@ def save_soap_record(patient_id: int, audio_file_name: str = None, audio_local_p
         if not record:
             raise Exception('Failed to retrieve inserted soap record')
         
-        # Also create voice_recordings entry if audio was uploaded
+        # Create voice_recordings entry if audio was uploaded
         if storage_path:
             voice_query = """
                 INSERT INTO voice_recordings (patient_id, soap_record_id, storage_path, file_name, is_realtime)
@@ -322,7 +313,7 @@ def save_soap_record(patient_id: int, audio_file_name: str = None, audio_local_p
         
         record['storage_path'] = storage_path
         
-        # Decrypt fields before returning
+        # Decrypt fields
         try:
             if record.get('transcript'):
                 record['transcript'] = decrypt_text(record['transcript'])
@@ -337,7 +328,7 @@ def save_soap_record(patient_id: int, audio_file_name: str = None, audio_local_p
         
         return record
     except Exception as e:
-        logger.error(f"Error saving SOAP record to Azure: {e}")
+        logger.error(f"Error saving SOAP record: {e}")
         if conn:
             conn.rollback()
         raise
@@ -347,6 +338,7 @@ def save_soap_record(patient_id: int, audio_file_name: str = None, audio_local_p
 
 
 def get_patient_soap_records(patient_id: int) -> List[Dict]:
+    """Get all SOAP records for a patient."""
     check_db_available()
     
     conn = None
@@ -376,7 +368,7 @@ def get_patient_soap_records(patient_id: int) -> List[Dict]:
         
         return records
     except Exception as e:
-        logger.error(f"Azure get_patient_soap_records error: {e}")
+        logger.error(f"get_patient_soap_records error: {e}")
         raise Exception(f"Failed to get SOAP records: {e}")
     finally:
         if conn:
@@ -384,6 +376,7 @@ def get_patient_soap_records(patient_id: int) -> List[Dict]:
 
 
 def update_soap_record(record_id: int, soap_sections: Dict) -> bool:
+    """Update SOAP sections for a record."""
     check_db_available()
     
     conn = None
@@ -398,7 +391,7 @@ def update_soap_record(record_id: int, soap_sections: Dict) -> bool:
         
         return True
     except Exception as e:
-        logger.error(f"Azure update_soap_record error: {e}")
+        logger.error(f"update_soap_record error: {e}")
         if conn:
             conn.rollback()
         raise Exception(f"Failed to update SOAP record: {e}")
@@ -407,64 +400,8 @@ def update_soap_record(record_id: int, soap_sections: Dict) -> bool:
             conn.close()
 
 
-def save_voice_recording(patient_id: int, soap_record_id: int, file_path: str,
-                         file_name: str, is_realtime: bool = False) -> Dict:
-    check_db_available()
-    check_blob_available()
-    
-    timestamp = int(time.time())
-    storage_path = f"{patient_id}/{timestamp}_{file_name}"
-    conn = None
-    
-    try:
-        # Upload encrypted audio to blob storage
-        with open(file_path, 'rb') as f:
-            raw = f.read()
-        
-        enc_b64 = encrypt_bytes(raw)
-        enc_bytes = base64.b64decode(enc_b64)
-        
-        blob_client = blob_service_client.get_blob_client(
-            container=CONTAINER_NAME,
-            blob=storage_path
-        )
-        blob_client.upload_blob(enc_bytes, overwrite=True)
-        logger.info(f"Uploaded audio file to Azure Blob Storage: {storage_path}")
-        
-        # Save metadata to database
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        query = """
-            INSERT INTO voice_recordings (patient_id, soap_record_id, storage_path, file_name, is_realtime)
-            VALUES (?, ?, ?, ?, ?)
-        """
-        cursor.execute(query, (patient_id, soap_record_id, storage_path, file_name, is_realtime))
-        conn.commit()
-        
-        # Get the inserted ID
-        cursor.execute("SELECT SCOPE_IDENTITY()")
-        recording_id = cursor.fetchone()[0]
-        
-        # Retrieve the full record
-        cursor.execute("SELECT * FROM voice_recordings WHERE id = ?", (recording_id,))
-        row = cursor.fetchone()
-        recording = row_to_dict(cursor, row)
-        
-        convert_datetime_fields(recording)
-        
-        return recording
-    except Exception as e:
-        logger.error(f"Error saving voice recording to Azure: {e}")
-        if conn:
-            conn.rollback()
-        raise
-    finally:
-        if conn:
-            conn.close()
-
-
 def get_voice_recordings(patient_id: int) -> List[Dict]:
+    """Get all voice recordings for a patient."""
     check_db_available()
     
     conn = None
@@ -478,13 +415,12 @@ def get_voice_recordings(patient_id: int) -> List[Dict]:
         rows = cursor.fetchall()
         recordings = [row_to_dict(cursor, row) for row in rows]
         
-        # Convert datetime fields
         for recording in recordings:
             convert_datetime_fields(recording)
         
         return recordings
     except Exception as e:
-        logger.error(f"Azure get_voice_recordings error: {e}")
+        logger.error(f"get_voice_recordings error: {e}")
         raise Exception(f"Failed to get voice recordings: {e}")
     finally:
         if conn:
@@ -492,11 +428,10 @@ def get_voice_recordings(patient_id: int) -> List[Dict]:
 
 
 def create_logged_user(email: str) -> Dict:
-    """Create a logged user record storing an encrypted email and returning the generated user id."""
+    """Create a logged user record."""
     check_db_available()
     
     user_id = generate_user_id()
-    
     email_norm = (email or '').strip().lower()
     email_hash = hashlib.sha256(email_norm.encode('utf-8')).hexdigest()
     
@@ -514,18 +449,16 @@ def create_logged_user(email: str) -> Dict:
         
         logger.info(f"Logged user created with id: {user_id}")
         
-        # Retrieve the created user
         cursor.execute("SELECT * FROM logged_users WHERE id = ?", (user_id,))
         row = cursor.fetchone()
         user = row_to_dict(cursor, row)
         
-        # Decrypt email
         if user and user.get('email'):
             user['email'] = decrypt_text(user['email'])
         
         return user
     except Exception as e:
-        logger.error(f"Azure create_logged_user error: {e}")
+        logger.error(f"create_logged_user error: {e}")
         if conn:
             conn.rollback()
         raise Exception(f"Failed to create logged user: {e}")
@@ -535,7 +468,7 @@ def create_logged_user(email: str) -> Dict:
 
 
 def get_logged_user_by_email(email: str) -> Optional[Dict]:
-    """Lookup logged user by deterministic email hash (case-insensitive)."""
+    """Lookup logged user by email hash."""
     check_db_available()
     
     email_norm = (email or '').strip().lower()
@@ -555,7 +488,6 @@ def get_logged_user_by_email(email: str) -> Optional[Dict]:
         
         user = row_to_dict(cursor, row)
         
-        # Decrypt email
         try:
             if user.get('email'):
                 user['email'] = decrypt_text(user['email'])
@@ -564,17 +496,16 @@ def get_logged_user_by_email(email: str) -> Optional[Dict]:
         
         return user
     except Exception as e:
-        logger.error(f"Azure get_logged_user_by_email error: {e}")
-        raise Exception(f"Failed to get logged user by email: {e}")
+        logger.error(f"get_logged_user_by_email error: {e}")
+        raise Exception(f"Failed to get logged user: {e}")
     finally:
         if conn:
             conn.close()
 
 
 def get_or_create_logged_user(email: str) -> Dict:
-    """Return existing logged user by email or create one if missing."""
+    """Return existing user or create new one."""
     existing = get_logged_user_by_email(email)
     if existing:
         return existing
-
     return create_logged_user(email)
