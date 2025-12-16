@@ -3,6 +3,7 @@ import json
 import uuid
 import tempfile
 import time
+import asyncio
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi import Request
@@ -15,9 +16,6 @@ import io
 from fastapi.responses import StreamingResponse
 from fastapi import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import Response as StarletteResponse
 from auth.google_auth import verify_google_token, create_jwt_token, verify_jwt_token
 from auth.middleware import get_current_user, optional_auth
 from pipeline.core import MedicalAudioProcessor
@@ -47,7 +45,10 @@ load_dotenv()
 async def log_user_to_db_async(email: str):
     """Create or update logged user record without blocking the response."""
     try:
-        create_logged_user(email)
+        # Use get_or_create to avoid errors if user already exists
+        # Run synchronous database call in executor to truly make it non-blocking
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, get_or_create_logged_user, email)
         logger.info(f"Background: Logged user created/updated for {email}")
     except Exception as e:
         logger.warning(f"Background: Failed to create logged user: {e}")
@@ -67,95 +68,20 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Parse allowed origins - support multiple URLs separated by comma
-# Support Azure Static Web Apps and other frontend URLs
-allowed_origins = [
-    'https://victorious-pond-00c76f410.3.azurestaticapps.net',  # Production frontend URL
-    'https://icy-sky-096f69610.3.azurestaticapps.net',  # Another frontend URL
-    'https://acucogn-ambient-scribe-c3hjhdhwd7emeyfn.centralus-01.azurewebsites.net',
-    'http://127.0.0.1:5173',
-    'http://localhost:5173',
-    FRONTEND_URL
-]
-
-# Add additional origins from environment variable (comma-separated)
-additional_origins = os.getenv('ALLOWED_ORIGINS', '')
-if additional_origins:
-    allowed_origins.extend([url.strip() for url in additional_origins.split(',') if url.strip()])
-
-# Remove duplicates and empty strings
-allowed_origins = list(set([url.strip() for url in allowed_origins if url and url.strip()]))
-
-# Log allowed origins for debugging (without sensitive info)
-logger.info(f"CORS allowed origins configured: {len(allowed_origins)} origin(s)")
-
-# Custom CORS middleware to support Azure Static Web Apps domains dynamically
-class FlexibleCORSMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        origin = request.headers.get("origin")
-        
-        # Check if origin is allowed (exact match or Azure Static Web Apps domain)
-        is_allowed = False
-        if origin:
-            # Check exact match
-            if origin in allowed_origins:
-                is_allowed = True
-            # Check if it's an Azure Static Web Apps domain
-            elif origin.startswith('https://') and origin.endswith('.azurestaticapps.net'):
-                is_allowed = True
-                logger.info(f"Allowing Azure Static Web Apps origin: {origin}")
-        
-        # Handle preflight requests
-        if request.method == "OPTIONS":
-            response = StarletteResponse(status_code=200)
-            if is_allowed and origin:
-                response.headers["Access-Control-Allow-Origin"] = origin
-                response.headers["Access-Control-Allow-Credentials"] = "true"
-                response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
-                response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept"
-                response.headers["Access-Control-Max-Age"] = "3600"
-            return response
-        
-        # Process the request
-        response = await call_next(request)
-        
-        # Add CORS headers to response
-        if is_allowed and origin:
-            response.headers["Access-Control-Allow-Origin"] = origin
-            response.headers["Access-Control-Allow-Credentials"] = "true"
-            response.headers["Access-Control-Expose-Headers"] = "*"
-        
-        return response
-
-# Use custom CORS middleware for flexible Azure Static Web Apps support
-# This allows any *.azurestaticapps.net domain in addition to explicitly allowed origins
-app.add_middleware(FlexibleCORSMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[FRONTEND_URL],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
 async def on_startup():
     logger.info("🚀 Backend startup: FastAPI application is initializing.")
-    
-    # Validate critical environment variables
-    from auth.google_auth import GOOGLE_CLIENT_ID, JWT_SECRET_KEY
-    if not GOOGLE_CLIENT_ID:
-        logger.error("❌ GOOGLE_CLIENT_ID is not set in environment variables!")
-    else:
-        logger.info("✅ GOOGLE_CLIENT_ID is configured")
-    
-    if not JWT_SECRET_KEY:
-        logger.error("❌ JWT_SECRET_KEY is not set in environment variables!")
-    else:
-        logger.info("✅ JWT_SECRET_KEY is configured")
-    
-    # Check Azure services availability
-    logger.info(f"✅ CORS configured for {len(allowed_origins)} origin(s)")
     logger.info(f"✅ Frontend URL: {FRONTEND_URL}")
     logger.info(f"✅ Cookie settings: Secure={COOKIE_SECURE}, SameSite={COOKIE_SAMESITE}")
-    
-    # Log Azure services status (already logged by azure_client.py but good to confirm)
-    logger.info(f"Azure SQL Database: {'✅ Available' if db_available else '⚠️ Unavailable - check configuration'}")
-    logger.info(f"Azure Blob Storage: {'✅ Available' if blob_available else '⚠️ Unavailable - check configuration'}")
 
 
 @app.on_event("shutdown")
@@ -186,8 +112,9 @@ async def health_check():
     # Check database connection
     if db_available:
         try:
-            from database.azure_client import get_db_connection
-            conn = get_db_connection()  # Uses proper connection with token if Managed Identity
+            import pyodbc
+            from database.azure_client import conn_str
+            conn = pyodbc.connect(conn_str, timeout=5)  # Quick 5-second test
             conn.close()
             health_status["database"] = "connected"
         except Exception as e:
@@ -676,7 +603,6 @@ async def google_auth(payload: dict, response: Response, request: Request):
 
         # Don't wait for database call - do it in background
         # This prevents blocking the login response
-        import asyncio
         asyncio.create_task(log_user_to_db_async(user_data['email']))
         
         logger.info(f"[{session_id}] User authenticated Successfully (login flow complete)")

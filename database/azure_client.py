@@ -101,7 +101,7 @@ try:
             # Test connection using the recommended method
             test_conn = get_db_connection()
             cursor = test_conn.cursor()
-            cursor.execute("SELECT 1 AS test, CURRENT_USER AS current_user")
+            cursor.execute("SELECT 1 AS test, USER_NAME() AS [user]")
             result = cursor.fetchone()
             cursor.close()
             test_conn.close()
