@@ -660,6 +660,15 @@ async def get_patient_soap_records_api(patient_id: str, user: dict = Depends(get
     """
     try:
         logged = get_logged_user_by_email(user['email'])
+        if not logged:
+            return JSONResponse(
+                content={
+                    "status": "error",
+                    "message": "Authenticated user not found in database."
+                },
+                status_code=404
+            )
+        
         patient = get_patient_by_id(patient_id, user_id=logged['id'])
         if not patient:
             return JSONResponse(
