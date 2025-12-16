@@ -37,7 +37,7 @@ from database.patient_db import (
 from database.azure_client import blob_service_client, db_available, blob_available
 
 from utils.encryption import decrypt_bytes
-
+from database.create_tables import ensure_tables
 load_dotenv()
 
 
@@ -80,8 +80,17 @@ app.add_middleware(
 @app.on_event("startup")
 async def on_startup():
     logger.info("🚀 Backend startup: FastAPI application is initializing.")
-    logger.info(f"✅ Frontend URL: {FRONTEND_URL}")
-    logger.info(f"✅ Cookie settings: Secure={COOKIE_SECURE}, SameSite={COOKIE_SAMESITE}")
+    try:
+        skip = os.getenv('SKIP_DB_AUTO_CREATE', '').strip().lower() in ('1', 'true', 'yes')
+        if skip:
+            logger.info("Skipping database table creation on startup (SKIP_DB_AUTO_CREATE set)")
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, ensure_tables)
+        logger.info("✅ Database tables ensured on startup")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not ensure DB tables on startup: {e}")
+
 
 
 @app.on_event("shutdown")
