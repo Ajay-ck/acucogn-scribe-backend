@@ -50,6 +50,7 @@ def get_azure_sql_token():
     # Convert token to format required by pyodbc
     token_bytes = token.token.encode("UTF-16-LE")
     token_struct = struct.pack(f'<I{len(token_bytes)}s', len(token_bytes), token_bytes)
+    logger.debug(f"Token acquired, expires in: {token.expires_on}")
     return token_struct
 
 
@@ -105,22 +106,41 @@ try:
         try:
             import pyodbc
             
-            # Build connection string for Managed Identity
+            # Build connection string for Managed Identity with enhanced timeouts
             connection_string = (
                 f"Driver={{ODBC Driver 18 for SQL Server}};"
                 f"Server=tcp:{server},1433;"
                 f"Database={database};"
                 f"Encrypt=yes;"
                 f"TrustServerCertificate=no;"
-                f"Connection Timeout=60;"
+                f"Connection Timeout=120;"
+                f"LoginTimeout=120;"
             )
             
             logger.info(f"🔄 Testing Azure SQL connection with Managed Identity to: {server}/{database}")
+            logger.info(f"Connection string (sanitized): Driver={{ODBC Driver 18 for SQL Server}};Server=tcp:{server},1433;Database={database};Encrypt=yes")
             
             # Get token and connect
             token = get_azure_sql_token()
-            test_conn = pyodbc.connect(connection_string, attrs_before={1256: token})
+            logger.debug("Token acquired, attempting connection...")
             
+            try:
+                test_conn = pyodbc.connect(connection_string, attrs_before={1256: token}, timeout=120)
+            except pyodbc.OperationalError as conn_error:
+                error_msg = str(conn_error)
+                logger.error(f"❌ ODBC Connection failed: {error_msg}")
+                
+                # Provide diagnostic information
+                if "HYT00" in error_msg or "timeout" in error_msg.lower():
+                    logger.error("\n🔍 TIMEOUT ERROR - This means:")
+                    logger.error("  • Token was acquired successfully (not an auth issue)")
+                    logger.error("  • But the ODBC driver couldn't connect to SQL Server")
+                    logger.error("  • Most likely causes:")
+                    logger.error("    1. ❌ SQL Server user for Managed Identity was NOT created")
+                    logger.error("    2. ❌ Firewall rule doesn't allow Web App to reach SQL Server")
+                    logger.error("    3. ❌ SQL Server is still starting up")
+                raise
+                
             # Test query - avoid aliasing with reserved keyword 'user'
             cursor = test_conn.cursor()
             cursor.execute("SELECT 1 AS test, CURRENT_USER AS user_name")

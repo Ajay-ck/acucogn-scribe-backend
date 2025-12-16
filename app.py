@@ -186,9 +186,8 @@ async def health_check():
     # Check database connection
     if db_available:
         try:
-            import pyodbc
-            from database.azure_client import conn_str
-            conn = pyodbc.connect(conn_str, timeout=5)  # Quick 5-second test
+            from database.azure_client import get_db_connection
+            conn = get_db_connection()  # Uses proper connection with token if Managed Identity
             conn.close()
             health_status["database"] = "connected"
         except Exception as e:
