@@ -1,15 +1,14 @@
 """
 Azure SQL Database client with FULL Managed Identity support using pyodbc.
-pyodbc has native support for Azure AD authentication, making it ideal for Azure deployments.
+Uses the recommended Authentication=ActiveDirectoryMsi method.
 
 Requirements:
 - pyodbc
-- azure-identity
+- azure-identity (for Blob Storage only)
 - Microsoft ODBC Driver 18 for SQL Server (pre-installed on Azure Web Apps)
 """
 import os
 import logging
-import struct
 from azure.storage.blob import BlobServiceClient
 from azure.identity import DefaultAzureCredential, ManagedIdentityCredential
 from dotenv import load_dotenv
@@ -26,66 +25,58 @@ connection_string = None  # Full connection string for pyodbc
 db_available = False
 use_managed_identity = os.getenv('USE_MANAGED_IDENTITY', 'false').lower() == 'true'
 
-def get_azure_sql_token():
-    """
-    Get Azure AD access token for Azure SQL Database.
-    Returns the token as bytes in the format required by pyodbc.
-    """
-    try:
-        # Try Managed Identity first (best for Azure Web Apps)
-        credential = ManagedIdentityCredential()
-        token = credential.get_token("https://database.windows.net/.default")
-        logger.info("✅ Acquired Azure SQL token using Managed Identity")
-    except Exception as mi_error:
-        logger.warning(f"⚠️ Managed Identity not available: {mi_error}")
-        try:
-            # Fallback to DefaultAzureCredential (works locally)
-            credential = DefaultAzureCredential()
-            token = credential.get_token("https://database.windows.net/.default")
-            logger.info("✅ Acquired Azure SQL token using DefaultAzureCredential")
-        except Exception as default_error:
-            logger.error(f"❌ Failed to acquire Azure AD token: {default_error}")
-            raise
-    
-    # Convert token to format required by pyodbc
-    token_bytes = token.token.encode("UTF-16-LE")
-    token_struct = struct.pack(f'<I{len(token_bytes)}s', len(token_bytes), token_bytes)
-    logger.debug(f"Token acquired, expires in: {token.expires_on}")
-    return token_struct
-
 
 def get_db_connection():
     """
     Get a database connection using pyodbc.
     Supports both Managed Identity and SQL Authentication.
+    Uses the RECOMMENDED Authentication=ActiveDirectoryMsi method for Managed Identity.
     """
     import pyodbc
     
     if use_managed_identity:
-        # Use Azure AD token authentication
+        # Use Azure AD Managed Identity authentication
         server = os.getenv('AZURE_SQL_SERVER')
         database = os.getenv('AZURE_SQL_DATABASE')
+        
+        # RECOMMENDED METHOD: Use Authentication=ActiveDirectoryMsi
+        # This lets pyodbc handle the entire Managed Identity flow
+        connection_string = (
+            f"Driver={{ODBC Driver 18 for SQL Server}};"
+            f"Server=tcp:{server},1433;"
+            f"Database={database};"
+            f"Authentication=ActiveDirectoryMsi;"
+            f"Encrypt=yes;"
+            f"TrustServerCertificate=no;"
+            f"Connection Timeout=30;"
+        )
+        
+        # No token needed - pyodbc handles Managed Identity automatically
+        conn = pyodbc.connect(connection_string)
+        return conn
+    else:
+        # Use SQL Authentication
+        server = os.getenv('AZURE_SQL_SERVER')
+        database = os.getenv('AZURE_SQL_DATABASE')
+        username = os.getenv('AZURE_SQL_USERNAME')
+        password = os.getenv('AZURE_SQL_PASSWORD')
         
         connection_string = (
             f"Driver={{ODBC Driver 18 for SQL Server}};"
             f"Server=tcp:{server},1433;"
             f"Database={database};"
+            f"Uid={username};"
+            f"Pwd={{password}};"
             f"Encrypt=yes;"
             f"TrustServerCertificate=no;"
-            f"Connection Timeout=60;"
+            f"Connection Timeout=30;"
         )
         
-        # Get fresh token
-        token = get_azure_sql_token()
-        
-        # Connect with token
-        conn = pyodbc.connect(connection_string, attrs_before={1256: token})
+        conn = pyodbc.connect(connection_string)
         return conn
-    else:
-        # Use SQL Authentication
-        return pyodbc.connect(connection_string)
 
 
+# Test connection at startup
 try:
     server = os.getenv('AZURE_SQL_SERVER')
     database = os.getenv('AZURE_SQL_DATABASE')
@@ -102,48 +93,15 @@ try:
     # ========================================================================
     if use_managed_identity:
         logger.info("🔐 Using Azure AD Managed Identity authentication")
+        logger.info(f"🔄 Testing Azure SQL connection with Managed Identity to: {server}/{database}")
         
         try:
             import pyodbc
             
-            # Build connection string for Managed Identity with enhanced timeouts
-            connection_string = (
-                f"Driver={{ODBC Driver 18 for SQL Server}};"
-                f"Server=tcp:{server},1433;"
-                f"Database={database};"
-                f"Encrypt=yes;"
-                f"TrustServerCertificate=no;"
-                f"Connection Timeout=120;"
-                f"LoginTimeout=120;"
-            )
-            
-            logger.info(f"🔄 Testing Azure SQL connection with Managed Identity to: {server}/{database}")
-            logger.info(f"Connection string (sanitized): Driver={{ODBC Driver 18 for SQL Server}};Server=tcp:{server},1433;Database={database};Encrypt=yes")
-            
-            # Get token and connect
-            token = get_azure_sql_token()
-            logger.debug("Token acquired, attempting connection...")
-            
-            try:
-                test_conn = pyodbc.connect(connection_string, attrs_before={1256: token}, timeout=120)
-            except pyodbc.OperationalError as conn_error:
-                error_msg = str(conn_error)
-                logger.error(f"❌ ODBC Connection failed: {error_msg}")
-                
-                # Provide diagnostic information
-                if "HYT00" in error_msg or "timeout" in error_msg.lower():
-                    logger.error("\n🔍 TIMEOUT ERROR - This means:")
-                    logger.error("  • Token was acquired successfully (not an auth issue)")
-                    logger.error("  • But the ODBC driver couldn't connect to SQL Server")
-                    logger.error("  • Most likely causes:")
-                    logger.error("    1. ❌ SQL Server user for Managed Identity was NOT created")
-                    logger.error("    2. ❌ Firewall rule doesn't allow Web App to reach SQL Server")
-                    logger.error("    3. ❌ SQL Server is still starting up")
-                raise
-                
-            # Test query - avoid aliasing with reserved keyword 'user'
+            # Test connection using the recommended method
+            test_conn = get_db_connection()
             cursor = test_conn.cursor()
-            cursor.execute("SELECT 1 AS test, CURRENT_USER AS user_name")
+            cursor.execute("SELECT 1 AS test, CURRENT_USER AS current_user")
             result = cursor.fetchone()
             cursor.close()
             test_conn.close()
@@ -161,10 +119,12 @@ try:
             raise
         except Exception as mi_error:
             logger.error(f"❌ Managed Identity connection failed: {mi_error}")
-            logger.error("Make sure:")
+            logger.error("Troubleshooting checklist:")
             logger.error("  1. System-assigned Managed Identity is enabled on your Web App")
-            logger.error("  2. Managed Identity has access to Azure SQL Database")
-            logger.error("  3. Azure SQL admin ran: CREATE USER [your-webapp-name] FROM EXTERNAL PROVIDER")
+            logger.error("  2. SQL Server firewall allows Azure services (Networking → Firewalls)")
+            logger.error("  3. Database user exists: CREATE USER [test-acu-backend] FROM EXTERNAL PROVIDER")
+            logger.error("  4. User has permissions: ALTER ROLE db_datareader ADD MEMBER [test-acu-backend]")
+            logger.error("  5. Check SQL Server → Azure Active Directory → Set admin")
             raise
     
     # ========================================================================
@@ -181,25 +141,14 @@ try:
             if not username: missing.append('AZURE_SQL_USERNAME')
             if not password: missing.append('AZURE_SQL_PASSWORD')
             logger.warning(f"⚠️ Missing SQL auth credentials: {', '.join(missing)}")
-            raise ValueError("Username and password required")
+            raise ValueError("Username and password required for SQL Authentication")
         
         try:
             import pyodbc
             
-            connection_string = (
-                f"Driver={{ODBC Driver 18 for SQL Server}};"
-                f"Server=tcp:{server},1433;"
-                f"Database={database};"
-                f"Uid={username};"
-                f"Pwd={password};"
-                f"Encrypt=yes;"
-                f"TrustServerCertificate=no;"
-                f"Connection Timeout=60;"
-            )
-            
             logger.info(f"🔄 Testing Azure SQL connection to: {server}/{database}")
             
-            test_conn = pyodbc.connect(connection_string)
+            test_conn = get_db_connection()
             cursor = test_conn.cursor()
             cursor.execute("SELECT 1 AS test")
             result = cursor.fetchone()
@@ -250,14 +199,17 @@ try:
             account_url=AZURE_STORAGE_ACCOUNT_URL,
             credential=credential
         )
+        # Test connection
         list(blob_service_client.list_containers(max_results=1))
         blob_available = True
         logger.info("✅ Azure Blob Storage initialized with Managed Identity")
     else:
         logger.warning("⚠️ No Blob Storage credentials configured")
+        logger.warning("Set either AZURE_STORAGE_CONNECTION_STRING or AZURE_STORAGE_ACCOUNT_URL")
 
 except Exception as e:
     logger.error(f"❌ Error initializing Blob Storage: {e}")
+    logger.warning("⚠️ Blob Storage operations will fail")
 
 # ============================================================================
 # STARTUP STATUS
