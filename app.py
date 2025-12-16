@@ -4,7 +4,7 @@ import uuid
 import tempfile
 import time
 import asyncio
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Body
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi import Request
 import mimetypes
@@ -22,10 +22,6 @@ from pipeline.core import MedicalAudioProcessor
 from agent.config import set_session_id, logger, GEMINI_API_KEY
 from agent.core import process_appointment
 from user.chat_service import process_user_question
-
-# ============================================================================
-# CHANGED: Import from cosmos_client instead of azure_client
-# ============================================================================
 from database.patient_db import (
     create_patient,
     get_all_patients,
@@ -38,11 +34,18 @@ from database.patient_db import (
     get_or_create_logged_user,
 )
 # Import the availability flags to check if services are ready
-from database.cosmos_client import blob_service_client, db_available, blob_available
+from database.cosmos_client import blob_service_client, db_available, blob_available, ensure_containers_exist
 
 from utils.encryption import decrypt_bytes
 
 load_dotenv()
+
+# Suppress verbose Azure SDK logging
+logging.getLogger('azure.cosmos._cosmos_http_logging_policy').setLevel(logging.WARNING)
+logging.getLogger('azure.core.pipeline.policies.http_logging_policy').setLevel(logging.WARNING)
+logging.getLogger('azure.identity').setLevel(logging.WARNING)
+logging.getLogger('msal').setLevel(logging.WARNING)
+logging.getLogger('urllib3.connectionpool').setLevel(logging.WARNING)
 
 
 # Helper function to log user to database in background (non-blocking)
@@ -59,12 +62,23 @@ async def log_user_to_db_async(email: str):
         # Don't raise - this shouldn't block login
 
 
-FRONTEND_URL = os.getenv('FRONTEND_URL', 'https://icy-sky-096f69610.3.azurestaticapps.net')
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'https://victorious-pond-00c76f410.3.azurestaticapps.net')
 
 
 ENV = os.getenv('ENV', 'development')
 COOKIE_SAMESITE = 'none'  
-COOKIE_SECURE = True       
+COOKIE_SECURE = True
+
+# Configure CORS origins based on environment
+if ENV == 'development':
+    allowed_origins = [
+        'http://localhost:5173',
+        'http://localhost:3000',
+        'http://localhost:8000',
+        FRONTEND_URL
+    ]
+else:
+    allowed_origins = [FRONTEND_URL]
 
 app = FastAPI(
     title="Medical Audio Processor API",
@@ -74,7 +88,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -86,6 +100,18 @@ async def on_startup():
     logger.info("🚀 Backend startup: FastAPI application is initializing.")
     logger.info(f"✅ Frontend URL: {FRONTEND_URL}")
     logger.info(f"✅ Cookie settings: Secure={COOKIE_SECURE}, SameSite={COOKIE_SAMESITE}")
+    
+    # Initialize Cosmos DB containers if they don't exist
+    if db_available:
+        try:
+            logger.info("📦 Ensuring Cosmos DB containers exist...")
+            ensure_containers_exist()
+            logger.info("✅ Cosmos DB containers initialized successfully")
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize Cosmos DB containers: {e}")
+            logger.warning("⚠️ App will continue but database operations may fail")
+    else:
+        logger.warning("⚠️ Cosmos DB not available, skipping container initialization")
 
 
 @app.on_event("shutdown")
@@ -113,9 +139,16 @@ async def health_check():
         "blob_storage": "unknown"
     }
     
-    # Check database connection
+    # Check Cosmos DB connection
     if db_available:
-        health_status["database"] = "connected"
+        try:
+            from database.cosmos_client import database
+            # Quick test: try to read database properties
+            database.read()
+            health_status["database"] = "connected"
+        except Exception as e:
+            health_status["database"] = f"error: {str(e)[:100]}"
+            health_status["status"] = "degraded"
     else:
         health_status["database"] = "not_configured"
         health_status["status"] = "degraded"
@@ -134,17 +167,18 @@ async def process_audio_api(
     audio: UploadFile = File(...),
     session_id: str = Form(None),
     is_realtime: str = Form(None), 
-    patient_id: str = Form(None)  # CHANGED: Now expects string UUID instead of int
+    patient_id: int = Form(None)
 ):
     """
     Processes an uploaded audio file to generate a medical transcript and SOAP summary.
-    If patient_id is provided, saves the result to the database.
+    If patient_token_id is provided, saves the result to the database.
     """
     
     overall_start = time.time()
     
     session_id = set_session_id(session_id or str(uuid.uuid4())[:8])
-    logger.info(f"[{session_id}] ▶️ Process audio START. Filename: {audio.filename}, Patient ID: {patient_id}")
+    logger.info(f"[{session_id}] ▶️ Process audio START. Filename: {audio.filename}, Patient ID: {patient_id}, Patient ID type: {type(patient_id)}")
+    logger.info(f"[{session_id}] Form data received - patient_id: {patient_id}, is_realtime: {is_realtime}")
 
     if not patient_id:
         logger.warning(f"[{session_id}] Missing patient selection in request - rejecting.")
@@ -180,7 +214,7 @@ async def process_audio_api(
         if is_realtime_flag:
             logger.info(f"[{session_id}] 🔧 Option 1 detected: Correcting transcript labels with Gemini...")
             correction_start = time.time()
-            corrected_transcript = processor.correct_transcript(transcript)
+            corrected_transcript = processor.correct_diarization(transcript)
             correction_time = time.time() - correction_start
             logger.info(f"[{session_id}] ✅ Transcript labels corrected. Using corrected transcript for SOAP generation. (Time: {correction_time:.2f}s)")
         else:
@@ -188,7 +222,7 @@ async def process_audio_api(
 
         logger.info(f"[{session_id}] 🤖 Passing transcript to Gemini for SOAP creation...")
         soap_start = time.time()
-        gemini_summary_raw = processor.query_gemini(corrected_transcript)
+        gemini_summary_raw = processor.generate_soap(corrected_transcript)
         soap_time = time.time() - soap_start
         
         if not gemini_summary_raw:
@@ -253,7 +287,7 @@ async def process_audio_api(
 
 
 @app.post("/approve_plan")
-async def approve_plan_api(payload: dict):
+async def approve_plan_api(payload: dict = Body(...)):
     """
     Approves the extracted medical plan and executes agent actions
     like processing medicines and scheduling appointments.
@@ -332,7 +366,7 @@ async def approve_plan_api(payload: dict):
 
 
 @app.post("/user_chat")
-async def user_chat_api(payload: dict):
+async def user_chat_api(payload: dict = Body(...)):
     """
     Handle user questions about their SOAP summary.
     Uses Gemini to determine if question is related to SOAP summary and answers accordingly.
@@ -409,7 +443,7 @@ async def user_chat_api(payload: dict):
 
 
 @app.post("/patients")
-async def create_patient_api(payload: dict, user: dict = Depends(get_current_user)):
+async def create_patient_api(payload: dict = Body(...), user: dict = Depends(get_current_user)):
     """
     Create a new patient record for the current authenticated user.
     """
@@ -507,9 +541,9 @@ async def get_patients_api(user: dict = Depends(get_current_user), session_id: s
 
 
 @app.get("/patients/{patient_id}")
-async def get_patient_api(patient_id: str, user: dict = Depends(get_current_user)):  # CHANGED: str instead of int
+async def get_patient_api(patient_id: int, user: dict = Depends(get_current_user)):
     """
-    Get a patient by ID (only if it belongs to the current user).
+    Get a patient by token ID (only if it belongs to the current user).
     """
     session_id = set_session_id(str(uuid.uuid4())[:8])
     logger.info(f"[{session_id}] Received request to get patient: {patient_id}")
@@ -547,13 +581,13 @@ async def get_patient_api(patient_id: str, user: dict = Depends(get_current_user
 
 
 @app.post("/auth/google")
-async def google_auth(payload: dict, response: Response, request: Request):  
+async def google_auth(payload: dict = Body(...), response: Response = Response(), request: Request = None):  
     """
     Verify Google OAuth token and set JWT token in HTTP-only cookie.
     Expects: {"token": "google_oauth_token"}
     """
     session_id = set_session_id(str(uuid.uuid4())[:8])
-    origin = request.headers.get("origin", "unknown")
+    origin = request.headers.get("origin", "unknown") if request else "unknown"
     logger.info(f"[{session_id}] Google authentication attempt from origin: {origin}")
     
     try:
@@ -632,6 +666,10 @@ async def verify_auth(user: dict = Depends(get_current_user)):
 async def logout(request: Request, response: Response):
     """
     Logout endpoint - deletes the HTTP-only cookie.
+
+    This endpoint no longer requires the authentication dependency so that a client
+    can perform logout even when the cookie is not (or cannot be) sent. The handler
+    logs whether the cookie was present but does not log any token or PII.
     """
 
     session_id = set_session_id(str(uuid.uuid4())[:8])
@@ -653,22 +691,13 @@ async def logout(request: Request, response: Response):
 
 
 @app.get("/patient/{patient_id}/soap_records")
-async def get_patient_soap_records_api(patient_id: str, user: dict = Depends(get_current_user)):  # CHANGED: str
+async def get_patient_soap_records_api(patient_id: int, user: dict = Depends(get_current_user)):
     """
     Get all SOAP records for a patient (only if it belongs to the current user).
     Returns a list of all medical notes with transcripts for the patient.
     """
     try:
         logged = get_logged_user_by_email(user['email'])
-        if not logged:
-            return JSONResponse(
-                content={
-                    "status": "error",
-                    "message": "Authenticated user not found in database."
-                },
-                status_code=404
-            )
-        
         patient = get_patient_by_id(patient_id, user_id=logged['id'])
         if not patient:
             return JSONResponse(
@@ -724,7 +753,7 @@ async def get_patient_soap_records_api(patient_id: str, user: dict = Depends(get
 
 
 @app.put("/soap_record/{record_id}")
-async def update_soap_record_api(record_id: str, payload: dict):  # CHANGED: str
+async def update_soap_record_api(record_id: int, payload: dict = Body(...)):
     """
     Update SOAP sections for an existing record.
     Used when doctor edits the SOAP summary.
@@ -733,7 +762,6 @@ async def update_soap_record_api(record_id: str, payload: dict):  # CHANGED: str
         from database.patient_db import update_soap_record
         
         soap_sections = payload.get('soap_sections', {})
-        patient_id = payload.get('patient_id')  # Optional but recommended for faster query
         
         if not soap_sections:
             return JSONResponse(
@@ -744,7 +772,7 @@ async def update_soap_record_api(record_id: str, payload: dict):  # CHANGED: str
                 status_code=400
             )
         
-        success = update_soap_record(record_id, soap_sections, patient_id=patient_id)
+        success = update_soap_record(record_id, soap_sections)
         
         if success:
             return JSONResponse(

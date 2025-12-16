@@ -1,6 +1,6 @@
 """
 Patient database operations using Azure Cosmos DB.
-Much simpler and more reliable than Azure SQL!
+Migrated from Azure SQL for better connectivity and reliability.
 """
 import os
 import uuid
@@ -9,19 +9,19 @@ import time
 import logging
 from datetime import datetime
 from typing import List, Dict, Optional
-import io
 import base64
 import hashlib
-from azure.cosmos import exceptions
+from azure.storage.blob import BlobServiceClient
 
 from database.cosmos_client import (
-    users_container, 
-    patients_container, 
-    soap_container, 
-    voice_container,
-    blob_service_client, 
-    db_available, 
-    blob_available
+    get_container,
+    CONTAINER_PATIENTS,
+    CONTAINER_SOAP_RECORDS,
+    CONTAINER_VOICE_RECORDINGS,
+    CONTAINER_LOGGED_USERS,
+    blob_service_client,
+    db_available,
+    blob_available,
 )
 from utils.encryption import (
     encrypt_text,
@@ -42,7 +42,7 @@ def check_db_available():
     if not db_available:
         raise RuntimeError(
             "Azure Cosmos DB is not available. "
-            "Check configuration and ensure COSMOS_ENDPOINT and COSMOS_KEY are set."
+            "Check configuration and ensure COSMOS_ENDPOINT is set."
         )
 
 
@@ -55,105 +55,54 @@ def check_blob_available():
         )
 
 
-def generate_uuid() -> str:
-    """Generate a UUID for document IDs"""
+def generate_token_id() -> str:
     return str(uuid.uuid4())
 
 
+def generate_user_id() -> str:
+    return str(uuid.uuid4())
+
+
+def generate_numeric_id() -> int:
+    """Generate a numeric ID using timestamp and random component for Cosmos DB compatibility."""
+    # Use timestamp (seconds since epoch) + random component to create a unique numeric ID
+    import random
+    timestamp_sec = int(time.time())
+    random_component = random.randint(100, 999)
+    # Combine: timestamp (10 digits) + random (3 digits) = 13 digit number
+    # This ensures uniqueness while keeping reasonable size
+    numeric_id = timestamp_sec * 1000 + random_component
+    return numeric_id
+
+
 def convert_datetime_fields(data: Dict) -> Dict:
-    """Cosmos DB stores datetimes as strings, so this is mainly for consistency"""
-    # In Cosmos DB, we store everything as ISO strings already
+    """Convert datetime objects to ISO format strings"""
+    if data is None:
+        return data
+    for key in data:
+        if isinstance(data[key], datetime):
+            data[key] = data[key].isoformat()
     return data
 
 
-# ============================================================================
-# LOGGED USERS
-# ============================================================================
-
-def create_logged_user(email: str) -> Dict:
-    """Create a logged user record."""
-    check_db_available()
+def _ensure_datetime_fields(doc: Dict) -> Dict:
+    """Ensure datetime fields are properly handled for Cosmos DB"""
+    if doc is None:
+        return doc
     
-    user_id = generate_uuid()
-    email_norm = (email or '').strip().lower()
-    email_hash = hashlib.sha256(email_norm.encode('utf-8')).hexdigest()
+    # Cosmos DB stores dates as ISO strings, but we need to handle them properly
+    for key in ['created_at', 'updated_at']:
+        if key in doc and isinstance(doc[key], str):
+            try:
+                # Try to parse ISO string back to datetime if needed
+                doc[key] = datetime.fromisoformat(doc[key].replace('Z', '+00:00'))
+            except:
+                pass
     
-    try:
-        user_doc = {
-            "id": user_id,  # Partition key
-            "email": encrypt_text(email),
-            "email_hash": email_hash,
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat()
-        }
-        
-        # Create user - single line!
-        created = users_container.create_item(body=user_doc)
-        logger.info(f"Logged user created with id: {user_id}")
-        
-        # Decrypt for return
-        created['email'] = decrypt_text(created['email'])
-        return created
-        
-    except exceptions.CosmosResourceExistsError:
-        logger.warning(f"User already exists with id: {user_id}")
-        raise Exception("User already exists")
-    except Exception as e:
-        logger.error(f"create_logged_user error: {e}")
-        raise Exception(f"Failed to create logged user: {e}")
+    return doc
 
 
-def get_logged_user_by_email(email: str) -> Optional[Dict]:
-    """Lookup logged user by email hash."""
-    check_db_available()
-    
-    email_norm = (email or '').strip().lower()
-    email_hash = hashlib.sha256(email_norm.encode('utf-8')).hexdigest()
-    
-    try:
-        # Query by email_hash
-        query = "SELECT * FROM c WHERE c.email_hash = @email_hash"
-        parameters = [{"name": "@email_hash", "value": email_hash}]
-        
-        items = list(users_container.query_items(
-            query=query,
-            parameters=parameters,
-            enable_cross_partition_query=True  # Since we're not querying by partition key
-        ))
-        
-        if not items:
-            return None
-        
-        user = items[0]
-        
-        # Decrypt email
-        try:
-            if user.get('email'):
-                user['email'] = decrypt_text(user['email'])
-        except Exception:
-            logger.exception('Failed to decrypt logged user email')
-        
-        return user
-        
-    except Exception as e:
-        logger.error(f"get_logged_user_by_email error: {e}")
-        raise Exception(f"Failed to get logged user: {e}")
-
-
-def get_or_create_logged_user(email: str) -> Dict:
-    """Return existing user or create new one."""
-    existing = get_logged_user_by_email(email)
-    if existing:
-        return existing
-    return create_logged_user(email)
-
-
-# ============================================================================
-# PATIENTS
-# ============================================================================
-
-def create_patient(name: str, address: str = '', phone_number: str = '', 
-                   problem: str = '', user_id: str = '') -> Dict:
+def create_patient(name: str, address: str = '', phone_number: str = '', problem: str = '', user_id: str = '') -> Dict:
     """Create a patient linked to a logged user."""
     check_db_available()
     
@@ -161,31 +110,48 @@ def create_patient(name: str, address: str = '', phone_number: str = '',
         raise ValueError('user_id is required to create a patient')
 
     try:
-        patient_id = generate_uuid()
+        container = get_container(CONTAINER_PATIENTS)
+        
+        # Generate numeric ID for backward compatibility with frontend
+        patient_id = generate_numeric_id()
+        # Use string ID for Cosmos DB document ID (partition key)
+        patient_id_str = str(patient_id)
+        created_at = datetime.utcnow().isoformat() + 'Z'
         
         patient_doc = {
-            "id": patient_id,
-            "user_id": user_id,  # Partition key - groups all patients for this user
-            "name": encrypt_text(name),
-            "address": encrypt_text(address),
-            "phone_number": encrypt_text(phone_number),
-            "problem": encrypt_text(problem),
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat()
+            'id': patient_id_str,  # Cosmos DB document ID (string)
+            'patient_id': patient_id,  # Numeric ID for frontend compatibility
+            'user_id': user_id,
+            'name': encrypt_text(name),
+            'address': encrypt_text(address),
+            'phone_number': encrypt_text(phone_number),
+            'problem': encrypt_text(problem),
+            'created_at': created_at,
         }
         
-        # Create patient - single line!
-        created = patients_container.create_item(body=patient_doc)
+        # Create item in Cosmos DB
+        container.create_item(body=patient_doc)
+        
         logger.info(f"Patient created for user_id: {user_id}, patient_id: {patient_id}")
         
+        # Retrieve and decrypt
+        patient = container.read_item(item=patient_id_str, partition_key=patient_id_str)
+        
         # Decrypt sensitive fields
-        created['name'] = decrypt_text(created['name'])
-        created['address'] = decrypt_text(created['address'])
-        created['phone_number'] = decrypt_text(created['phone_number'])
-        created['problem'] = decrypt_text(created['problem'])
+        patient['name'] = decrypt_text(patient['name'])
+        patient['address'] = decrypt_text(patient['address'])
+        patient['phone_number'] = decrypt_text(patient['phone_number'])
+        patient['problem'] = decrypt_text(patient['problem'])
         
-        return created
+        # Use numeric patient_id for frontend compatibility
+        if 'patient_id' in patient:
+            patient['id'] = patient['patient_id']
+        else:
+            patient['id'] = int(patient['id']) if patient['id'].isdigit() else patient_id
         
+        convert_datetime_fields(patient)
+        
+        return patient
     except Exception as e:
         logger.error(f"create_patient error: {e}")
         raise Exception(f"Failed to create patient: {e}")
@@ -196,27 +162,29 @@ def get_all_patients(user_id: str = '') -> List[Dict]:
     check_db_available()
     
     try:
+        container = get_container(CONTAINER_PATIENTS)
+        
         if user_id:
-            # Fast query using partition key!
+            # Query patients by user_id
             query = "SELECT * FROM c WHERE c.user_id = @user_id ORDER BY c.created_at DESC"
             parameters = [{"name": "@user_id", "value": user_id}]
-            
-            # partition_key makes this SUPER fast
-            items = list(patients_container.query_items(
+            items = container.query_items(
                 query=query,
                 parameters=parameters,
-                partition_key=user_id
-            ))
+                enable_cross_partition_query=True
+            )
         else:
-            # Get all patients (cross-partition query)
+            # Get all patients
             query = "SELECT * FROM c ORDER BY c.created_at DESC"
-            items = list(patients_container.query_items(
+            items = container.query_items(
                 query=query,
                 enable_cross_partition_query=True
-            ))
+            )
         
-        # Decrypt patient fields
-        for patient in items:
+        patients = list(items)
+        
+        # Decrypt patient fields and normalize IDs
+        for patient in patients:
             try:
                 if patient.get('name'):
                     patient['name'] = decrypt_text(patient['name'])
@@ -226,47 +194,54 @@ def get_all_patients(user_id: str = '') -> List[Dict]:
                     patient['phone_number'] = decrypt_text(patient['phone_number'])
                 if patient.get('problem'):
                     patient['problem'] = decrypt_text(patient['problem'])
+                
+                # Use numeric patient_id for frontend compatibility
+                if 'patient_id' in patient:
+                    patient['id'] = patient['patient_id']
+                else:
+                    # Try to convert string ID to int if possible
+                    try:
+                        patient['id'] = int(patient['id'])
+                    except (ValueError, TypeError):
+                        pass
+                
+                convert_datetime_fields(patient)
             except Exception:
                 logger.exception('Failed to decrypt patient fields')
         
-        return items
-        
+        return patients
     except Exception as e:
         logger.error(f"get_all_patients error: {e}")
         raise Exception(f"Failed to get patients: {e}")
 
 
-def get_patient_by_id(patient_id: str, user_id: str = '') -> Optional[Dict]:
+def get_patient_by_id(patient_id: int, user_id: str = '') -> Optional[Dict]:
     """Get a patient by ID."""
     check_db_available()
     
     try:
-        # Try to read directly if we have user_id (partition key)
-        if user_id:
-            try:
-                patient = patients_container.read_item(
-                    item=patient_id,
-                    partition_key=user_id
-                )
-            except exceptions.CosmosResourceNotFoundError:
-                return None
-        else:
-            # Query without partition key (slower)
-            query = "SELECT * FROM c WHERE c.id = @patient_id"
+        container = get_container(CONTAINER_PATIENTS)
+        
+        # Convert patient_id to string for Cosmos DB lookup
+        patient_id_str = str(patient_id)
+        
+        # Try to find by document ID first, then by patient_id field
+        try:
+            patient = container.read_item(item=patient_id_str, partition_key=patient_id_str)
+        except Exception:
+            # If not found by ID, query by patient_id field
+            query = "SELECT * FROM c WHERE c.patient_id = @patient_id"
             parameters = [{"name": "@patient_id", "value": patient_id}]
-            
-            items = list(patients_container.query_items(
+            items = list(container.query_items(
                 query=query,
                 parameters=parameters,
                 enable_cross_partition_query=True
             ))
-            
             if not items:
                 return None
-            
             patient = items[0]
         
-        # Check ownership if user_id provided
+        # Check ownership
         if user_id and patient.get('user_id') != user_id:
             logger.warning(f"Access denied: user {user_id} tried to access patient {patient_id}")
             return None
@@ -281,23 +256,28 @@ def get_patient_by_id(patient_id: str, user_id: str = '') -> Optional[Dict]:
                 patient['phone_number'] = decrypt_text(patient['phone_number'])
             if patient.get('problem'):
                 patient['problem'] = decrypt_text(patient['problem'])
+            
+            # Use numeric patient_id for frontend compatibility
+            if 'patient_id' in patient:
+                patient['id'] = patient['patient_id']
+            else:
+                try:
+                    patient['id'] = int(patient['id'])
+                except (ValueError, TypeError):
+                    pass
+            
+            convert_datetime_fields(patient)
         except Exception:
             logger.exception('Failed to decrypt patient')
         
         return patient
-        
     except Exception as e:
         logger.error(f"get_patient_by_id error: {e}")
         raise Exception(f"Failed to get patient: {e}")
 
 
-# ============================================================================
-# SOAP RECORDS
-# ============================================================================
-
-def save_soap_record(patient_id: str, audio_file_name: str = None, 
-                     audio_local_path: str = None, transcript: str = '', 
-                     original_transcript: Optional[str] = None,
+def save_soap_record(patient_id: int, audio_file_name: str = None, audio_local_path: str = None,
+                     transcript: str = '', original_transcript: Optional[str] = None,
                      soap_sections: Optional[Dict] = None) -> Dict:
     """Save a SOAP record and optionally upload audio to Azure Blob Storage."""
     check_db_available()
@@ -333,152 +313,298 @@ def save_soap_record(patient_id: str, audio_file_name: str = None,
                 raise Exception(f"Audio upload failed: {upload_error}")
         
         # Save SOAP record to Cosmos DB
-        record_id = generate_uuid()
+        soap_container = get_container(CONTAINER_SOAP_RECORDS)
+        
+        # Generate numeric record ID for backward compatibility
+        record_id = generate_numeric_id()
+        record_id_str = str(record_id)
+        created_at = datetime.utcnow().isoformat() + 'Z'
+        
         audio_file_to_store = storage_path if storage_path else audio_file_name
         
+        logger.info(f"SOAP sections before encryption: {soap_sections}")
+        
         soap_doc = {
-            "id": record_id,
-            "patient_id": patient_id,  # Partition key
-            "audio_file_name": audio_file_to_store,
-            "transcript": encrypt_text(transcript),
-            "original_transcript": encrypt_text(original_transcript) if original_transcript is not None else None,
-            "soap_sections": encrypt_json(soap_sections or {}),
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat()
+            'id': record_id_str,  # Cosmos DB document ID (string)
+            'record_id': record_id,  # Numeric ID for frontend compatibility
+            'patient_id': patient_id,  # Keep as int for queries
+            'audio_file_name': audio_file_to_store,
+            'transcript': encrypt_text(transcript),
+            'original_transcript': encrypt_text(original_transcript) if original_transcript is not None else None,
+            'soap_sections': encrypt_json(soap_sections or {}),
+            'created_at': created_at,
+            'updated_at': created_at,
         }
         
-        # Create SOAP record - single line!
-        created = soap_container.create_item(body=soap_doc)
-        logger.info(f"SOAP record created with id: {record_id}")
+        logger.info(f"SOAP sections encrypted: {soap_doc['soap_sections']}")
+        soap_container.create_item(body=soap_doc)
+        
+        # Retrieve the inserted record
+        record = soap_container.read_item(item=record_id_str, partition_key=record_id_str)
+        
+        if not record:
+            raise Exception('Failed to retrieve inserted soap record')
         
         # Create voice_recordings entry if audio was uploaded
         if storage_path:
+            voice_container = get_container(CONTAINER_VOICE_RECORDINGS)
+            voice_id = generate_numeric_id()
+            voice_id_str = str(voice_id)
+            
             voice_doc = {
-                "id": generate_uuid(),
-                "patient_id": patient_id,  # Partition key
-                "soap_record_id": record_id,
-                "storage_path": storage_path,
-                "file_name": audio_file_name or os.path.basename(audio_local_path),
-                "is_realtime": False,
-                "created_at": datetime.utcnow().isoformat()
+                'id': voice_id_str,
+                'voice_id': voice_id,
+                'patient_id': patient_id,
+                'soap_record_id': record_id,
+                'storage_path': storage_path,
+                'file_name': audio_file_name or os.path.basename(audio_local_path),
+                'is_realtime': False,
+                'created_at': created_at,
             }
+            
             voice_container.create_item(body=voice_doc)
-            logger.info(f"Voice recording entry created")
         
-        created['storage_path'] = storage_path
+        record['storage_path'] = storage_path
         
-        # Decrypt fields
+        # Decrypt fields and normalize ID
         try:
-            if created.get('transcript'):
-                created['transcript'] = decrypt_text(created['transcript'])
-            if created.get('original_transcript'):
-                created['original_transcript'] = decrypt_text(created['original_transcript'])
-            if created.get('soap_sections'):
-                created['soap_sections'] = decrypt_json(created['soap_sections'])
+            if record.get('transcript'):
+                record['transcript'] = decrypt_text(record['transcript'])
+            if record.get('original_transcript'):
+                record['original_transcript'] = decrypt_text(record['original_transcript'])
+            if record.get('soap_sections'):
+                record['soap_sections'] = decrypt_json(record['soap_sections'])
+            
+            # Use numeric record_id for frontend compatibility
+            if 'record_id' in record:
+                record['id'] = record['record_id']
+            else:
+                try:
+                    record['id'] = int(record['id'])
+                except (ValueError, TypeError):
+                    pass
         except Exception:
             logger.exception('Failed to decrypt soap record')
         
-        return created
+        convert_datetime_fields(record)
         
+        return record
     except Exception as e:
         logger.error(f"Error saving SOAP record: {e}")
         raise
 
 
-def get_patient_soap_records(patient_id: str) -> List[Dict]:
+def get_patient_soap_records(patient_id: int) -> List[Dict]:
     """Get all SOAP records for a patient."""
     check_db_available()
     
     try:
-        # Fast query using partition key!
-        query = "SELECT * FROM c WHERE c.patient_id = @patient_id ORDER BY c.created_at DESC"
-        parameters = [{"name": "@patient_id", "value": patient_id}]
+        container = get_container(CONTAINER_SOAP_RECORDS)
         
-        records = list(soap_container.query_items(
+        # FIX: Pass patient_id as INTEGER, not string
+        query = "SELECT * FROM c WHERE c.patient_id = @patient_id ORDER BY c.created_at DESC"
+        parameters = [{"name": "@patient_id", "value": patient_id}]  # ✅ Keep as int
+        
+        items = container.query_items(
             query=query,
             parameters=parameters,
-            partition_key=patient_id  # Super fast!
-        ))
+            enable_cross_partition_query=True
+        )
         
-        # Decrypt fields
-        for record in records:
+        records = list(items)
+        logger.info(f"Retrieved {len(records)} SOAP records for patient {patient_id}")
+        
+        # Add debug logging to see what's in the database
+        if len(records) == 0:
+            logger.warning(f"No SOAP records found for patient_id={patient_id}")
+            # Debug: Check what patient_ids exist
+            debug_query = "SELECT DISTINCT c.patient_id FROM c"
+            debug_items = list(container.query_items(
+                query=debug_query,
+                enable_cross_partition_query=True
+            ))
+            logger.info(f"Available patient_ids in database: {debug_items}")
+        
+        # Decrypt fields and normalize IDs
+        for i, record in enumerate(records):
             try:
+                logger.debug(f"Record {i}: soap_sections type = {type(record.get('soap_sections'))}, value = {record.get('soap_sections')}")
+                
                 if record.get('transcript'):
                     record['transcript'] = decrypt_text(record['transcript'])
                 if record.get('original_transcript'):
                     record['original_transcript'] = decrypt_text(record['original_transcript'])
                 if record.get('soap_sections'):
-                    record['soap_sections'] = decrypt_json(record['soap_sections'])
-            except Exception:
-                logger.exception('Failed to decrypt soap record')
+                    decrypted_soap = decrypt_json(record['soap_sections'])
+                    logger.info(f"Record {i}: Decrypted SOAP sections: {decrypted_soap}")
+                    record['soap_sections'] = decrypted_soap or {}
+                else:
+                    logger.warning(f"Record {i}: soap_sections is empty or None")
+                    record['soap_sections'] = {}
+                
+                # Use numeric record_id for frontend compatibility
+                if 'record_id' in record:
+                    record['id'] = record['record_id']
+                else:
+                    try:
+                        record['id'] = int(record['id'])
+                    except (ValueError, TypeError):
+                        pass
+                
+                convert_datetime_fields(record)
+            except Exception as e:
+                logger.exception(f'Failed to decrypt soap record {i}: {e}')
+                record['soap_sections'] = {}
         
         return records
-        
     except Exception as e:
         logger.error(f"get_patient_soap_records error: {e}")
         raise Exception(f"Failed to get SOAP records: {e}")
 
-
-def update_soap_record(record_id: str, soap_sections: Dict, patient_id: str = None) -> bool:
+def update_soap_record(record_id: int, soap_sections: Dict) -> bool:
     """Update SOAP sections for a record."""
     check_db_available()
     
     try:
-        # Read the existing record first
-        if patient_id:
-            # Fast read with partition key
-            record = soap_container.read_item(
-                item=record_id,
-                partition_key=patient_id
-            )
-        else:
-            # Query without partition key
-            query = "SELECT * FROM c WHERE c.id = @record_id"
+        container = get_container(CONTAINER_SOAP_RECORDS)
+        
+        record_id_str = str(record_id)
+        
+        # Try to find by document ID first, then by record_id field
+        try:
+            record = container.read_item(item=record_id_str, partition_key=record_id_str)
+        except Exception:
+            # If not found by ID, query by record_id field
+            query = "SELECT * FROM c WHERE c.record_id = @record_id"
             parameters = [{"name": "@record_id", "value": record_id}]
-            
-            items = list(soap_container.query_items(
+            items = list(container.query_items(
                 query=query,
                 parameters=parameters,
                 enable_cross_partition_query=True
             ))
-            
             if not items:
-                raise Exception("SOAP record not found")
-            
+                raise Exception(f"SOAP record {record_id} not found")
             record = items[0]
+            record_id_str = record['id']  # Use the actual document ID
         
-        # Update the record
+        # Update SOAP sections
         record['soap_sections'] = encrypt_json(soap_sections)
-        record['updated_at'] = datetime.utcnow().isoformat()
+        record['updated_at'] = datetime.utcnow().isoformat() + 'Z'
         
-        # Replace the item
-        soap_container.replace_item(item=record['id'], body=record)
-        logger.info(f"SOAP record updated: {record_id}")
+        # Replace item
+        container.replace_item(item=record_id_str, body=record)
         
         return True
-        
     except Exception as e:
         logger.error(f"update_soap_record error: {e}")
         raise Exception(f"Failed to update SOAP record: {e}")
 
 
-def get_voice_recordings(patient_id: str) -> List[Dict]:
+def get_voice_recordings(patient_id: int) -> List[Dict]:
     """Get all voice recordings for a patient."""
     check_db_available()
     
     try:
-        # Fast query using partition key!
-        query = "SELECT * FROM c WHERE c.patient_id = @patient_id ORDER BY c.created_at DESC"
-        parameters = [{"name": "@patient_id", "value": patient_id}]
+        container = get_container(CONTAINER_VOICE_RECORDINGS)
         
-        recordings = list(voice_container.query_items(
+        patient_id_str = str(patient_id)
+        query = "SELECT * FROM c WHERE c.patient_id = @patient_id ORDER BY c.created_at DESC"
+        parameters = [{"name": "@patient_id", "value": patient_id_str}]
+        
+        items = container.query_items(
             query=query,
             parameters=parameters,
-            partition_key=patient_id
-        ))
+            enable_cross_partition_query=True
+        )
+        
+        recordings = list(items)
+        
+        for recording in recordings:
+            convert_datetime_fields(recording)
         
         return recordings
-        
     except Exception as e:
         logger.error(f"get_voice_recordings error: {e}")
         raise Exception(f"Failed to get voice recordings: {e}")
+
+
+def create_logged_user(email: str) -> Dict:
+    """Create a logged user record."""
+    check_db_available()
+    
+    user_id = generate_user_id()
+    email_norm = (email or '').strip().lower()
+    email_hash = hashlib.sha256(email_norm.encode('utf-8')).hexdigest()
+    
+    try:
+        container = get_container(CONTAINER_LOGGED_USERS)
+        
+        created_at = datetime.utcnow().isoformat() + 'Z'
+        
+        user_doc = {
+            'id': user_id,
+            'email': encrypt_text(email),
+            'email_hash': email_hash,
+            'created_at': created_at,
+        }
+        
+        container.create_item(body=user_doc)
+        
+        logger.info(f"Logged user created with id: {user_id}")
+        
+        # Retrieve user
+        user = container.read_item(item=user_id, partition_key=user_id)
+        
+        if user and user.get('email'):
+            user['email'] = decrypt_text(user['email'])
+        
+        return user
+    except Exception as e:
+        logger.error(f"create_logged_user error: {e}")
+        raise Exception(f"Failed to create logged user: {e}")
+
+
+def get_logged_user_by_email(email: str) -> Optional[Dict]:
+    """Lookup logged user by email hash."""
+    check_db_available()
+    
+    email_norm = (email or '').strip().lower()
+    email_hash = hashlib.sha256(email_norm.encode('utf-8')).hexdigest()
+    
+    try:
+        container = get_container(CONTAINER_LOGGED_USERS)
+        
+        query = "SELECT * FROM c WHERE c.email_hash = @email_hash"
+        parameters = [{"name": "@email_hash", "value": email_hash}]
+        
+        items = container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        )
+        
+        users = list(items)
+        
+        if not users:
+            return None
+        
+        user = users[0]  # Get first match
+        
+        try:
+            if user.get('email'):
+                user['email'] = decrypt_text(user['email'])
+        except Exception:
+            logger.exception('Failed to decrypt logged user email')
+        
+        return user
+    except Exception as e:
+        logger.error(f"get_logged_user_by_email error: {e}")
+        raise Exception(f"Failed to get logged user: {e}")
+
+
+def get_or_create_logged_user(email: str) -> Dict:
+    """Return existing user or create new one."""
+    existing = get_logged_user_by_email(email)
+    if existing:
+        return existing
+    return create_logged_user(email)

@@ -19,4 +19,4 @@ cryptography
 azure-storage-blob==12.24.0
 azure-identity==1.17.1
 azure-keyvault-secrets==4.8.0
-azure-cosmos==4.5.1
+azure-cosmos>=4.5.1

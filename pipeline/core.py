@@ -3,7 +3,7 @@ import logging
 from typing import List, Tuple, Dict, Optional
 from pipeline.audio_utils import ensure_wav, transcribe_with_deepgram
 
-from pipeline.gemini_llm import query_gemini_summary, correct_transcript_labels
+from pipeline.gemini_llm import generate_soap, correct_diarization
 
 
 class MedicalAudioProcessor:
@@ -16,8 +16,8 @@ class MedicalAudioProcessor:
     def transcribe_file(self, audio_path: str, beam_size: int = 5):
     
         return transcribe_with_deepgram(audio_path, diarize=True)
-    def query_gemini(self, transcript: str) -> str:
-        return query_gemini_summary(transcript)
+    def generate_soap(self, transcript: str) -> str:
+        return generate_soap(transcript)
     
-    def correct_transcript(self, transcript: str) -> str:
-        return correct_transcript_labels(transcript)
+    def correct_diarization(self, transcript: str) -> str:
+        return correct_diarization(transcript)

@@ -1,15 +1,16 @@
 """
-Azure Cosmos DB client - MUCH simpler than Azure SQL!
-No Managed Identity headaches, just works with a connection string.
+Azure Cosmos DB client with Managed Identity support.
+Replaces Azure SQL Database for better connectivity and reliability.
 
-Automatically creates database and containers on startup if they don't exist.
-Supports both Serverless and Provisioned throughput modes.
+Requirements:
+- azure-cosmos
+- azure-identity (for Managed Identity)
 """
 import os
 import logging
-from azure.cosmos import CosmosClient, PartitionKey, exceptions
 from azure.storage.blob import BlobServiceClient
 from azure.identity import DefaultAzureCredential
+from azure.cosmos import CosmosClient, PartitionKey, exceptions
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -17,119 +18,142 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# AZURE COSMOS DB CONNECTION (Simple and Reliable!)
+# AZURE COSMOS DB CONNECTION WITH MANAGED IDENTITY
 # ============================================================================
 cosmos_client = None
 database = None
-users_container = None
-patients_container = None
-soap_container = None
-voice_container = None
 db_available = False
 
+# Container names (equivalent to SQL tables)
+CONTAINER_PATIENTS = "patients"
+CONTAINER_SOAP_RECORDS = "soap_records"
+CONTAINER_VOICE_RECORDINGS = "voice_recordings"
+CONTAINER_LOGGED_USERS = "logged_users"
 
-def create_container_safe(database, container_id: str, partition_key_path: str):
-    """
-    Create container if it doesn't exist.
-    Handles both Serverless and Provisioned throughput modes.
-    """
-    try:
-        # Try serverless mode first (no throughput specified)
-        container = database.create_container_if_not_exists(
-            id=container_id,
-            partition_key=PartitionKey(path=partition_key_path)
-        )
-        logger.info(f"✅ Container created/verified: {container_id}")
-        return container
-    except exceptions.CosmosHttpResponseError as e:
-        # If serverless fails, try with manual throughput
-        if "offer" in str(e).lower() or "throughput" in str(e).lower():
-            logger.info(f"Serverless not available, using provisioned throughput for {container_id}")
-            container = database.create_container_if_not_exists(
-                id=container_id,
-                partition_key=PartitionKey(path=partition_key_path),
-                offer_throughput=400  # Minimum for manual throughput
-            )
-            logger.info(f"✅ Container created/verified: {container_id}")
-            return container
-        else:
-            raise
+# Container references
+containers = {
+    CONTAINER_PATIENTS: None,
+    CONTAINER_SOAP_RECORDS: None,
+    CONTAINER_VOICE_RECORDINGS: None,
+    CONTAINER_LOGGED_USERS: None,
+}
 
-
+# Initialize Cosmos DB connection
 try:
-    COSMOS_ENDPOINT = os.getenv("COSMOS_ENDPOINT")
-    COSMOS_KEY = os.getenv("COSMOS_KEY")
+    COSMOS_ENDPOINT = os.getenv('COSMOS_ENDPOINT')
+    COSMOS_DATABASE_NAME = os.getenv('COSMOS_DATABASE_NAME', 'medical-db')
+    COSMOS_KEY = os.getenv('COSMOS_KEY')  # Optional: for key-based auth
     
-    if not COSMOS_ENDPOINT or not COSMOS_KEY:
-        logger.warning("⚠️ Cosmos DB credentials not configured")
-        logger.warning("Set COSMOS_ENDPOINT and COSMOS_KEY in environment variables")
-        logger.warning("Example:")
-        logger.warning("  COSMOS_ENDPOINT=https://your-account.documents.azure.com:443/")
-        logger.warning("  COSMOS_KEY=your-primary-key")
-    else:
-        logger.info("🔐 Connecting to Azure Cosmos DB...")
-        logger.info(f"   Endpoint: {COSMOS_ENDPOINT}")
-        
-        # Simple connection - just endpoint and key!
+    if not COSMOS_ENDPOINT:
+        logger.warning("⚠️ COSMOS_ENDPOINT not set. Cosmos DB operations will fail.")
+        raise ValueError("COSMOS_ENDPOINT is required")
+    
+    # Initialize Cosmos DB client
+    if COSMOS_KEY:
+        logger.info("🔐 Using Cosmos DB with key-based authentication")
         cosmos_client = CosmosClient(COSMOS_ENDPOINT, COSMOS_KEY)
-        
-        # Create database if it doesn't exist
-        logger.info("📦 Creating/verifying database: medical_db")
-        database = cosmos_client.create_database_if_not_exists(id="medical_db")
-        logger.info("✅ Database ready: medical_db")
-        
-        # Create containers (like tables in SQL)
-        # These will be automatically created on first run!
-        logger.info("📦 Creating/verifying containers...")
-        
-        # Container 1: logged_users (partition key: /id)
-        users_container = create_container_safe(
-            database=database,
-            container_id="logged_users",
-            partition_key_path="/id"
-        )
-        
-        # Container 2: patients (partition key: /user_id)
-        # This groups all patients for the same user together for fast queries
-        patients_container = create_container_safe(
-            database=database,
-            container_id="patients",
-            partition_key_path="/user_id"
-        )
-        
-        # Container 3: soap_records (partition key: /patient_id)
-        # This groups all SOAP records for the same patient together
-        soap_container = create_container_safe(
-            database=database,
-            container_id="soap_records",
-            partition_key_path="/patient_id"
-        )
-        
-        # Container 4: voice_recordings (partition key: /patient_id)
-        voice_container = create_container_safe(
-            database=database,
-            container_id="voice_recordings",
-            partition_key_path="/patient_id"
-        )
-        
-        db_available = True
-        logger.info("=" * 60)
-        logger.info("✅ Cosmos DB initialized successfully - NO TIMEOUTS! 🎉")
-        logger.info("   All containers are ready to use!")
-        logger.info("=" * 60)
-
-except exceptions.CosmosHttpResponseError as e:
-    logger.error(f"❌ Cosmos DB HTTP Error: {e.status_code} - {e.message}")
-    logger.error("   Check your COSMOS_ENDPOINT and COSMOS_KEY are correct")
-    logger.warning("⚠️ App will start but database operations will fail")
+    else:
+        logger.info("🔐 Using Cosmos DB with Managed Identity")
+        credential = DefaultAzureCredential()
+        cosmos_client = CosmosClient(COSMOS_ENDPOINT, credential=credential)
+    
+    # Get or create database
+    try:
+        database = cosmos_client.get_database_client(COSMOS_DATABASE_NAME)
+        database.read()
+        logger.info(f"✅ Connected to existing Cosmos DB database: {COSMOS_DATABASE_NAME}")
+    except exceptions.CosmosResourceNotFoundError:
+        logger.info(f"📦 Creating new Cosmos DB database: {COSMOS_DATABASE_NAME}")
+        database = cosmos_client.create_database(COSMOS_DATABASE_NAME)
+        logger.info(f"✅ Created Cosmos DB database: {COSMOS_DATABASE_NAME}")
+    
+    db_available = True
+    logger.info("✅ Azure Cosmos DB initialized successfully")
+    
 except Exception as e:
     logger.error(f"❌ Error initializing Cosmos DB: {e}")
     logger.warning("⚠️ App will start but database operations will fail")
     import traceback
     logger.error(traceback.format_exc())
 
+
+def ensure_containers_exist():
+    """
+    Ensure all required containers exist. Create them if they don't.
+    This function should be called on app startup.
+    """
+    if not db_available or not database:
+        logger.error("❌ Cannot create containers: Cosmos DB not available")
+        return False
+    
+    container_configs = [
+        {
+            'name': CONTAINER_PATIENTS,
+            'partition_key': PartitionKey(path="/id"),
+            'description': 'Patient records'
+        },
+        {
+            'name': CONTAINER_SOAP_RECORDS,
+            'partition_key': PartitionKey(path="/id"),
+            'description': 'SOAP medical records'
+        },
+        {
+            'name': CONTAINER_VOICE_RECORDINGS,
+            'partition_key': PartitionKey(path="/id"),
+            'description': 'Voice recording metadata'
+        },
+        {
+            'name': CONTAINER_LOGGED_USERS,
+            'partition_key': PartitionKey(path="/id"),
+            'description': 'Logged user records'
+        },
+    ]
+    
+    for config in container_configs:
+        container_name = config['name']
+        try:
+            # Try to get existing container
+            container = database.get_container_client(container_name)
+            container.read()
+            containers[container_name] = container
+            logger.info(f"✅ Container '{container_name}' already exists")
+        except exceptions.CosmosResourceNotFoundError:
+            # Container doesn't exist, create it
+            try:
+                logger.info(f"📦 Creating container '{container_name}'...")
+                # For serverless Cosmos DB accounts, don't specify offer_throughput
+                container = database.create_container(
+                    id=container_name,
+                    partition_key=config['partition_key']
+                )
+                containers[container_name] = container
+                logger.info(f"✅ Created container '{container_name}'")
+            except Exception as create_error:
+                logger.error(f"❌ Failed to create container '{container_name}': {create_error}")
+                raise
+        except Exception as e:
+            logger.error(f"❌ Error checking/creating container '{container_name}': {e}")
+            raise
+    
+    logger.info("✅ All Cosmos DB containers are ready")
+    return True
+
+
+def get_container(container_name: str):
+    """Get a container client by name."""
+    if container_name not in containers or containers[container_name] is None:
+        if not db_available or not database:
+            raise RuntimeError("Cosmos DB is not available")
+        try:
+            containers[container_name] = database.get_container_client(container_name)
+        except Exception as e:
+            logger.error(f"❌ Failed to get container '{container_name}': {e}")
+            raise
+    return containers[container_name]
+
+
 # ============================================================================
-# AZURE BLOB STORAGE (same as before)
+# AZURE BLOB STORAGE WITH MANAGED IDENTITY (UNCHANGED)
 # ============================================================================
 blob_service_client = None
 blob_available = False
@@ -171,8 +195,6 @@ except Exception as e:
 logger.info("=" * 60)
 logger.info("=== Azure Services Status ===")
 logger.info(f"  Cosmos DB: {'✅ Available' if db_available else '❌ Unavailable'}")
-if db_available:
-    logger.info(f"    - Database: medical_db")
-    logger.info(f"    - Containers: logged_users, patients, soap_records, voice_recordings")
 logger.info(f"  Blob Storage: {'✅ Available' if blob_available else '❌ Unavailable'}")
 logger.info("=" * 60)
+
