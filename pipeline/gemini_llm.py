@@ -144,12 +144,12 @@ IMPORTANT REMINDERS:
 
 ### Output Format (JSON only):
 ```json
-{
-  "Subjective": "Patient reports...",
-  "Objective": "Vital signs: BP 120/80...",
-  "Assessment": "Primary diagnosis: ...",
-  "Plan": "1. Medication: ... 2. Follow-up: ..."
-}
+{{
+    "Subjective": "Patient reports...",
+    "Objective": "Vital signs: BP 120/80...",
+    "Assessment": "Primary diagnosis: ...",
+    "Plan": "1. Medication: ... 2. Follow-up: ..."
+}}
 ```
 
 ### SOAP Note JSON:
