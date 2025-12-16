@@ -123,7 +123,7 @@ try:
             
             # Test query - avoid aliasing with reserved keyword 'user'
             cursor = test_conn.cursor()
-            cursor.execute("SELECT 1 AS test, CURRENT_USER AS current_user")
+            cursor.execute("SELECT 1 AS test, CURRENT_USER AS user_name")
             result = cursor.fetchone()
             cursor.close()
             test_conn.close()
