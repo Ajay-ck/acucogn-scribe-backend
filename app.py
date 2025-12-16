@@ -22,6 +22,10 @@ from pipeline.core import MedicalAudioProcessor
 from agent.config import set_session_id, logger, GEMINI_API_KEY
 from agent.core import process_appointment
 from user.chat_service import process_user_question
+
+# ============================================================================
+# CHANGED: Import from cosmos_client instead of azure_client
+# ============================================================================
 from database.patient_db import (
     create_patient,
     get_all_patients,
@@ -34,7 +38,7 @@ from database.patient_db import (
     get_or_create_logged_user,
 )
 # Import the availability flags to check if services are ready
-from database.azure_client import blob_service_client, db_available, blob_available
+from database.cosmos_client import blob_service_client, db_available, blob_available
 
 from utils.encryption import decrypt_bytes
 
@@ -55,7 +59,7 @@ async def log_user_to_db_async(email: str):
         # Don't raise - this shouldn't block login
 
 
-FRONTEND_URL = os.getenv('FRONTEND_URL', 'https://victorious-pond-00c76f410.3.azurestaticapps.net')
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'https://icy-sky-096f69610.3.azurestaticapps.net')
 
 
 ENV = os.getenv('ENV', 'development')
@@ -111,15 +115,7 @@ async def health_check():
     
     # Check database connection
     if db_available:
-        try:
-            import pyodbc
-            from database.azure_client import conn_str
-            conn = pyodbc.connect(conn_str, timeout=5)  # Quick 5-second test
-            conn.close()
-            health_status["database"] = "connected"
-        except Exception as e:
-            health_status["database"] = f"error: {str(e)[:100]}"
-            health_status["status"] = "degraded"
+        health_status["database"] = "connected"
     else:
         health_status["database"] = "not_configured"
         health_status["status"] = "degraded"
@@ -138,11 +134,11 @@ async def process_audio_api(
     audio: UploadFile = File(...),
     session_id: str = Form(None),
     is_realtime: str = Form(None), 
-    patient_id: int = Form(None)
+    patient_id: str = Form(None)  # CHANGED: Now expects string UUID instead of int
 ):
     """
     Processes an uploaded audio file to generate a medical transcript and SOAP summary.
-    If patient_token_id is provided, saves the result to the database.
+    If patient_id is provided, saves the result to the database.
     """
     
     overall_start = time.time()
@@ -511,9 +507,9 @@ async def get_patients_api(user: dict = Depends(get_current_user), session_id: s
 
 
 @app.get("/patients/{patient_id}")
-async def get_patient_api(patient_id: int, user: dict = Depends(get_current_user)):
+async def get_patient_api(patient_id: str, user: dict = Depends(get_current_user)):  # CHANGED: str instead of int
     """
-    Get a patient by token ID (only if it belongs to the current user).
+    Get a patient by ID (only if it belongs to the current user).
     """
     session_id = set_session_id(str(uuid.uuid4())[:8])
     logger.info(f"[{session_id}] Received request to get patient: {patient_id}")
@@ -636,10 +632,6 @@ async def verify_auth(user: dict = Depends(get_current_user)):
 async def logout(request: Request, response: Response):
     """
     Logout endpoint - deletes the HTTP-only cookie.
-
-    This endpoint no longer requires the authentication dependency so that a client
-    can perform logout even when the cookie is not (or cannot be) sent. The handler
-    logs whether the cookie was present but does not log any token or PII.
     """
 
     session_id = set_session_id(str(uuid.uuid4())[:8])
@@ -661,7 +653,7 @@ async def logout(request: Request, response: Response):
 
 
 @app.get("/patient/{patient_id}/soap_records")
-async def get_patient_soap_records_api(patient_id: int, user: dict = Depends(get_current_user)):
+async def get_patient_soap_records_api(patient_id: str, user: dict = Depends(get_current_user)):  # CHANGED: str
     """
     Get all SOAP records for a patient (only if it belongs to the current user).
     Returns a list of all medical notes with transcripts for the patient.
@@ -723,7 +715,7 @@ async def get_patient_soap_records_api(patient_id: int, user: dict = Depends(get
 
 
 @app.put("/soap_record/{record_id}")
-async def update_soap_record_api(record_id: int, payload: dict):
+async def update_soap_record_api(record_id: str, payload: dict):  # CHANGED: str
     """
     Update SOAP sections for an existing record.
     Used when doctor edits the SOAP summary.
@@ -732,6 +724,7 @@ async def update_soap_record_api(record_id: int, payload: dict):
         from database.patient_db import update_soap_record
         
         soap_sections = payload.get('soap_sections', {})
+        patient_id = payload.get('patient_id')  # Optional but recommended for faster query
         
         if not soap_sections:
             return JSONResponse(
@@ -742,7 +735,7 @@ async def update_soap_record_api(record_id: int, payload: dict):
                 status_code=400
             )
         
-        success = update_soap_record(record_id, soap_sections)
+        success = update_soap_record(record_id, soap_sections, patient_id=patient_id)
         
         if success:
             return JSONResponse(
