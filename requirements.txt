@@ -8,6 +8,7 @@ sendgrid
 openpyxl
 fastapi
 uvicorn[standard]
+gunicorn>=21.2.0 
 python-multipart
 google-auth==2.23.0
 google-auth-oauthlib==1.1.0
