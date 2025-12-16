@@ -121,9 +121,9 @@ try:
             token = get_azure_sql_token()
             test_conn = pyodbc.connect(connection_string, attrs_before={1256: token})
             
-            # Test query
+            # Test query - avoid aliasing with reserved keyword 'user'
             cursor = test_conn.cursor()
-            cursor.execute("SELECT 1 AS test, CURRENT_USER AS user")
+            cursor.execute("SELECT 1 AS test, CURRENT_USER AS current_user")
             result = cursor.fetchone()
             cursor.close()
             test_conn.close()
