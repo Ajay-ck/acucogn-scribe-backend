@@ -4,6 +4,7 @@ import json
 from typing import Optional, Dict, Any
 import logging
 import hashlib
+import hmac
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -153,3 +154,32 @@ def decrypt_json(b64: Optional[str]) -> Optional[Dict[str, Any]]:
         return json.loads(decrypt_text(b64))
     except Exception:
         return None
+
+
+
+
+def hash_password(password: str, iterations: int = 200_000) -> str:
+    """Create a secure PBKDF2-HMAC-SHA256 password hash string.
+
+    Format: pbkdf2$<iterations>$<salt_b64>$<dk_b64>
+    """
+    if password is None:
+        raise ValueError("password must not be None")
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, iterations)
+    return f"pbkdf2${iterations}${base64.b64encode(salt).decode()}${base64.b64encode(dk).decode()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    """Verify a password against the stored hash produced by hash_password."""
+    try:
+        parts = stored_hash.split('$')
+        if len(parts) != 4 or parts[0] != 'pbkdf2':
+            return False
+        iterations = int(parts[1])
+        salt = base64.b64decode(parts[2])
+        expected = base64.b64decode(parts[3])
+        dk = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, iterations)
+        return hmac.compare_digest(dk, expected)
+    except Exception:
+        return False

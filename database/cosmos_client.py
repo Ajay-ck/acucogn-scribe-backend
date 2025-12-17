@@ -17,20 +17,17 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# ============================================================================
-# AZURE COSMOS DB CONNECTION WITH MANAGED IDENTITY
-# ============================================================================
 cosmos_client = None
 database = None
 db_available = False
 
-# Container names (equivalent to SQL tables)
+
 CONTAINER_PATIENTS = "patients"
 CONTAINER_SOAP_RECORDS = "soap_records"
 CONTAINER_VOICE_RECORDINGS = "voice_recordings"
 CONTAINER_LOGGED_USERS = "logged_users"
 
-# Container references
+
 containers = {
     CONTAINER_PATIENTS: None,
     CONTAINER_SOAP_RECORDS: None,
@@ -38,17 +35,16 @@ containers = {
     CONTAINER_LOGGED_USERS: None,
 }
 
-# Initialize Cosmos DB connection
 try:
     COSMOS_ENDPOINT = os.getenv('COSMOS_ENDPOINT')
     COSMOS_DATABASE_NAME = os.getenv('COSMOS_DATABASE_NAME', 'medical-db')
-    COSMOS_KEY = os.getenv('COSMOS_KEY')  # Optional: for key-based auth
+    COSMOS_KEY = os.getenv('COSMOS_KEY')  
     
     if not COSMOS_ENDPOINT:
         logger.warning("⚠️ COSMOS_ENDPOINT not set. Cosmos DB operations will fail.")
         raise ValueError("COSMOS_ENDPOINT is required")
     
-    # Initialize Cosmos DB client
+    
     if COSMOS_KEY:
         logger.info("🔐 Using Cosmos DB with key-based authentication")
         cosmos_client = CosmosClient(COSMOS_ENDPOINT, COSMOS_KEY)
@@ -57,7 +53,7 @@ try:
         credential = DefaultAzureCredential()
         cosmos_client = CosmosClient(COSMOS_ENDPOINT, credential=credential)
     
-    # Get or create database
+    
     try:
         database = cosmos_client.get_database_client(COSMOS_DATABASE_NAME)
         database.read()
@@ -112,16 +108,16 @@ def ensure_containers_exist():
     for config in container_configs:
         container_name = config['name']
         try:
-            # Try to get existing container
+            
             container = database.get_container_client(container_name)
             container.read()
             containers[container_name] = container
             logger.info(f"✅ Container '{container_name}' already exists")
         except exceptions.CosmosResourceNotFoundError:
-            # Container doesn't exist, create it
+            
             try:
                 logger.info(f"📦 Creating container '{container_name}'...")
-                # For serverless Cosmos DB accounts, don't specify offer_throughput
+                
                 container = database.create_container(
                     id=container_name,
                     partition_key=config['partition_key']
@@ -152,9 +148,7 @@ def get_container(container_name: str):
     return containers[container_name]
 
 
-# ============================================================================
-# AZURE BLOB STORAGE WITH MANAGED IDENTITY (UNCHANGED)
-# ============================================================================
+
 blob_service_client = None
 blob_available = False
 
@@ -177,7 +171,7 @@ try:
             account_url=AZURE_STORAGE_ACCOUNT_URL,
             credential=credential
         )
-        # Test connection
+        
         list(blob_service_client.list_containers(max_results=1))
         blob_available = True
         logger.info("✅ Azure Blob Storage initialized with Managed Identity")
@@ -189,9 +183,7 @@ except Exception as e:
     logger.error(f"❌ Error initializing Blob Storage: {e}")
     logger.warning("⚠️ Blob Storage operations will fail")
 
-# ============================================================================
-# STARTUP STATUS
-# ============================================================================
+
 logger.info("=" * 60)
 logger.info("=== Azure Services Status ===")
 logger.info(f"  Cosmos DB: {'✅ Available' if db_available else '❌ Unavailable'}")

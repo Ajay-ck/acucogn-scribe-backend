@@ -13,10 +13,25 @@ from dotenv import load_dotenv
 import logging
 import base64
 import io
+from datetime import datetime, timedelta
 from fastapi.responses import StreamingResponse
 from fastapi import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from auth.google_auth import verify_google_token, create_jwt_token, verify_jwt_token
+from database.patient_db import (
+    create_patient,
+    get_all_patients,
+    get_patient_by_id,
+    save_soap_record,
+    get_patient_soap_records,
+    get_voice_recordings,
+    get_logged_user_by_google,
+    create_logged_user,
+    get_or_create_logged_user,
+    create_user,
+    get_user_by_email,
+)
+from utils.encryption import decrypt_text, encrypt_text, hash_password, verify_password
 from auth.middleware import get_current_user, optional_auth
 from pipeline.core import MedicalAudioProcessor
 from agent.config import set_session_id, logger, GEMINI_API_KEY
@@ -29,7 +44,7 @@ from database.patient_db import (
     save_soap_record,
     get_patient_soap_records,
     get_voice_recordings,
-    get_logged_user_by_email,
+    get_logged_user_by_google,
     create_logged_user,
     get_or_create_logged_user,
 )
@@ -48,18 +63,19 @@ logging.getLogger('msal').setLevel(logging.WARNING)
 logging.getLogger('urllib3.connectionpool').setLevel(logging.WARNING)
 
 
-# Helper function to log user to database in background (non-blocking)
-async def log_user_to_db_async(email: str):
-    """Create or update logged user record without blocking the response."""
+
+async def log_user_to_db_async(email: str, name: str = None):
+    """Create or update logged user record without blocking the response.
+
+    Accepts optional `name` so that the logged user entry can include a display name.
+    """
     try:
-        # Use get_or_create to avoid errors if user already exists
-        # Run synchronous database call in executor to truly make it non-blocking
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, get_or_create_logged_user, email)
-        logger.info(f"Background: Logged user created/updated for {email}")
+        await loop.run_in_executor(None, get_or_create_logged_user, email, name)
+        logger.info("Background: Logged user created/updated (PII omitted)")
     except Exception as e:
         logger.warning(f"Background: Failed to create logged user: {e}")
-        # Don't raise - this shouldn't block login
+        
 
 
 FRONTEND_URL = os.getenv('FRONTEND_URL', 'https://victorious-pond-00c76f410.3.azurestaticapps.net')
@@ -466,10 +482,10 @@ async def create_patient_api(payload: dict = Body(...), user: dict = Depends(get
         )
 
     try:
-        logged = get_logged_user_by_email(user['email'])
+        logged = get_logged_user_by_google(user['email'])
         if not logged:
-            logger.info(f"[{session_id}] Logged user not found for email: {user.get('email')}; creating user record")
-            logged = get_or_create_logged_user(user['email'])
+            logger.info(f"[{session_id}] Logged user not found for authenticated user; creating user record")
+            logged = get_or_create_logged_user(user['email'], user.get('name'))
 
         if not logged:
             raise Exception("Authenticated user not found and could not be created")
@@ -509,9 +525,9 @@ async def get_patients_api(user: dict = Depends(get_current_user), session_id: s
     logger.info(f"[{session_id_obj}] Received request to get patients")
 
     try:
-        logged = get_logged_user_by_email(user['email'])
+        logged = get_logged_user_by_google(user['email'])
         if not logged:
-            logger.warning(f"[{session_id_obj}] Logged user not found for email: {user.get('email')}")
+            logger.warning(f"[{session_id_obj}] Logged user not found for authenticated user")
             return JSONResponse(
                 content={
                     "status": "error",
@@ -549,7 +565,7 @@ async def get_patient_api(patient_id: int, user: dict = Depends(get_current_user
     logger.info(f"[{session_id}] Received request to get patient: {patient_id}")
 
     try:
-        logged = get_logged_user_by_email(user['email'])
+        logged = get_logged_user_by_google(user['email'])
         patient = get_patient_by_id(patient_id, user_id=logged['id'])
         
         if not patient:
@@ -633,7 +649,8 @@ async def google_auth(payload: dict = Body(...), response: Response = Response()
 
         # Don't wait for database call - do it in background
         # This prevents blocking the login response
-        asyncio.create_task(log_user_to_db_async(user_data['email']))
+        asyncio.create_task(log_user_to_db_async(user_data.get('email'), user_data.get('name')))
+        logger.info(f"[{session_id}] User signed in via Google")
         
         logger.info(f"[{session_id}] User authenticated Successfully (login flow complete)")
 
@@ -643,6 +660,92 @@ async def google_auth(payload: dict = Body(...), response: Response = Response()
     except Exception as e:
         logger.error(f"[{session_id}] Google authentication error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Authentication error: {str(e)}")
+
+
+@app.post('/auth/register')
+async def register(payload: dict = Body(...)):
+    """Register a user via email/password (no OTP)."""
+    session_id = set_session_id(str(uuid.uuid4())[:8])
+    email = (payload.get('email') or '').strip().lower()
+    password = payload.get('password') or ''
+
+    if not email or not password:
+        raise HTTPException(status_code=400, detail='Email and password are required')
+
+    try:
+        existing = get_user_by_email(email)
+        if existing:
+            logger.info(f"[{session_id}] Registration attempted for existing user (PII omitted)")
+            raise HTTPException(status_code=400, detail='User already registered')
+
+        name = (payload.get('name') or '').strip()
+        hashed = hash_password(password)
+        create_user(email, hashed, name)
+        logger.info(f"[{session_id}] User registered via email/password")
+
+        
+        try:
+            asyncio.create_task(log_user_to_db_async(email, name))
+        except Exception:
+            logger.warning("Failed to schedule background logged-user creation")
+
+        return JSONResponse(content={"status": "success", "message": "User registered. Please sign in."}, status_code=200)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[{session_id}] Registration error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
+
+
+@app.post('/auth/login')
+async def email_login(payload: dict = Body(...), response: Response = Response(), request: Request = None):
+    """Login with email and password. Sets auth cookie on success."""
+    session_id = set_session_id(str(uuid.uuid4())[:8])
+    email = (payload.get('email') or '').strip().lower()
+    password = payload.get('password') or ''
+
+    if not email or not password:
+        raise HTTPException(status_code=400, detail='Email and password are required')
+
+    try:
+        user = get_user_by_email(email)
+        if not user or not user.get('is_verified'):
+            raise HTTPException(status_code=401, detail='Invalid credentials')
+
+        stored_hash = user.get('password_hash')
+        if not stored_hash or not verify_password(password, stored_hash):
+            raise HTTPException(status_code=401, detail='Invalid credentials')
+
+        # Build user data for JWT
+        user_data = {
+            'email': user.get('email'),
+            'name': user.get('name') or user.get('email'),
+            'picture': '',
+            'sub': user.get('id')
+        }
+        jwt_token = create_jwt_token(user_data)
+
+        resp = JSONResponse(content={"status": "success", "user": {"email": user_data['email'], "name": user_data['name'], "picture": ''}})
+        resp.set_cookie(
+            key='auth_token',
+            value=jwt_token,
+            httponly=True,
+            secure=COOKIE_SECURE,
+            samesite=COOKIE_SAMESITE,
+            max_age=86400,
+            path='/'
+        )
+
+        
+        asyncio.create_task(log_user_to_db_async(user_data['email'], user_data.get('name')))
+        logger.info(f"[{session_id}] User signed in via email/password")
+
+        return resp
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[{session_id}] Email login error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
 
 @app.get("/auth/verify")
 async def verify_auth(user: dict = Depends(get_current_user)):
@@ -697,7 +800,7 @@ async def get_patient_soap_records_api(patient_id: int, user: dict = Depends(get
     Returns a list of all medical notes with transcripts for the patient.
     """
     try:
-        logged = get_logged_user_by_email(user['email'])
+        logged = get_logged_user_by_google(user['email'])
         patient = get_patient_by_id(patient_id, user_id=logged['id'])
         if not patient:
             return JSONResponse(

@@ -7,7 +7,7 @@ import uuid
 import json
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import base64
 import hashlib
@@ -401,9 +401,9 @@ def get_patient_soap_records(patient_id: int) -> List[Dict]:
     try:
         container = get_container(CONTAINER_SOAP_RECORDS)
         
-        # FIX: Pass patient_id as INTEGER, not string
+        
         query = "SELECT * FROM c WHERE c.patient_id = @patient_id ORDER BY c.created_at DESC"
-        parameters = [{"name": "@patient_id", "value": patient_id}]  # ✅ Keep as int
+        parameters = [{"name": "@patient_id", "value": patient_id}]  
         
         items = container.query_items(
             query=query,
@@ -414,10 +414,10 @@ def get_patient_soap_records(patient_id: int) -> List[Dict]:
         records = list(items)
         logger.info(f"Retrieved {len(records)} SOAP records for patient {patient_id}")
         
-        # Add debug logging to see what's in the database
+        
         if len(records) == 0:
             logger.warning(f"No SOAP records found for patient_id={patient_id}")
-            # Debug: Check what patient_ids exist
+            
             debug_query = "SELECT DISTINCT c.patient_id FROM c"
             debug_items = list(container.query_items(
                 query=debug_query,
@@ -425,7 +425,7 @@ def get_patient_soap_records(patient_id: int) -> List[Dict]:
             ))
             logger.info(f"Available patient_ids in database: {debug_items}")
         
-        # Decrypt fields and normalize IDs
+        
         for i, record in enumerate(records):
             try:
                 logger.debug(f"Record {i}: soap_sections type = {type(record.get('soap_sections'))}, value = {record.get('soap_sections')}")
@@ -442,7 +442,7 @@ def get_patient_soap_records(patient_id: int) -> List[Dict]:
                     logger.warning(f"Record {i}: soap_sections is empty or None")
                     record['soap_sections'] = {}
                 
-                # Use numeric record_id for frontend compatibility
+                
                 if 'record_id' in record:
                     record['id'] = record['record_id']
                 else:
@@ -470,11 +470,11 @@ def update_soap_record(record_id: int, soap_sections: Dict) -> bool:
         
         record_id_str = str(record_id)
         
-        # Try to find by document ID first, then by record_id field
+        
         try:
             record = container.read_item(item=record_id_str, partition_key=record_id_str)
         except Exception:
-            # If not found by ID, query by record_id field
+            
             query = "SELECT * FROM c WHERE c.record_id = @record_id"
             parameters = [{"name": "@record_id", "value": record_id}]
             items = list(container.query_items(
@@ -485,13 +485,13 @@ def update_soap_record(record_id: int, soap_sections: Dict) -> bool:
             if not items:
                 raise Exception(f"SOAP record {record_id} not found")
             record = items[0]
-            record_id_str = record['id']  # Use the actual document ID
+            record_id_str = record['id']  
         
-        # Update SOAP sections
+        
         record['soap_sections'] = encrypt_json(soap_sections)
         record['updated_at'] = datetime.utcnow().isoformat() + 'Z'
         
-        # Replace item
+        
         container.replace_item(item=record_id_str, body=record)
         
         return True
@@ -528,13 +528,17 @@ def get_voice_recordings(patient_id: int) -> List[Dict]:
         raise Exception(f"Failed to get voice recordings: {e}")
 
 
-def create_logged_user(email: str) -> Dict:
-    """Create a logged user record."""
+def create_logged_user(email: str = None, name: str = None) -> Dict:
+    """Create a logged user record.
+
+    Stores optional `name` encrypted and `email_hash` for lookup. This record is intended
+    for lightweight tracking of signed-in users (not authentication credentials).
+    """
     check_db_available()
     
     user_id = generate_user_id()
-    email_norm = (email or '').strip().lower()
-    email_hash = hashlib.sha256(email_norm.encode('utf-8')).hexdigest()
+    email_norm = (email or '').strip().lower() if email else ''
+    email_hash = hashlib.sha256(email_norm.encode('utf-8')).hexdigest() if email else None
     
     try:
         container = get_container(CONTAINER_LOGGED_USERS)
@@ -543,8 +547,9 @@ def create_logged_user(email: str) -> Dict:
         
         user_doc = {
             'id': user_id,
-            'email': encrypt_text(email),
+            'email': encrypt_text(email) if email else None,
             'email_hash': email_hash,
+            'name': encrypt_text(name) if name else None,
             'created_at': created_at,
         }
         
@@ -555,8 +560,13 @@ def create_logged_user(email: str) -> Dict:
         # Retrieve user
         user = container.read_item(item=user_id, partition_key=user_id)
         
-        if user and user.get('email'):
-            user['email'] = decrypt_text(user['email'])
+        try:
+            if user and user.get('email'):
+                user['email'] = decrypt_text(user['email'])
+            if user and user.get('name'):
+                user['name'] = decrypt_text(user['name'])
+        except Exception:
+            logger.exception('Failed to decrypt logged user fields')
         
         return user
     except Exception as e:
@@ -564,7 +574,7 @@ def create_logged_user(email: str) -> Dict:
         raise Exception(f"Failed to create logged user: {e}")
 
 
-def get_logged_user_by_email(email: str) -> Optional[Dict]:
+def get_logged_user_by_google(email: str) -> Optional[Dict]:
     """Lookup logged user by email hash."""
     check_db_available()
     
@@ -588,13 +598,15 @@ def get_logged_user_by_email(email: str) -> Optional[Dict]:
         if not users:
             return None
         
-        user = users[0]  # Get first match
+        user = users[0]  
         
         try:
             if user.get('email'):
                 user['email'] = decrypt_text(user['email'])
+            if user.get('name'):
+                user['name'] = decrypt_text(user['name'])
         except Exception:
-            logger.exception('Failed to decrypt logged user email')
+            logger.exception('Failed to decrypt logged user fields')
         
         return user
     except Exception as e:
@@ -602,9 +614,86 @@ def get_logged_user_by_email(email: str) -> Optional[Dict]:
         raise Exception(f"Failed to get logged user: {e}")
 
 
-def get_or_create_logged_user(email: str) -> Dict:
-    """Return existing user or create new one."""
-    existing = get_logged_user_by_email(email)
+def get_or_create_logged_user(email: str, name: str = None) -> Dict:
+    """Return existing user or create new one. Accepts optional `name` to set when creating."""
+    existing = get_logged_user_by_google(email)
     if existing:
         return existing
-    return create_logged_user(email)
+    return create_logged_user(email=email, name=name)
+
+
+
+def create_user(email: str, password_hash: str, name: str = None) -> Dict:
+    """Create a user record"""
+    check_db_available()
+
+    user_id = generate_user_id()
+    email_norm = (email or '').strip().lower()
+    email_hash = hashlib.sha256(email_norm.encode('utf-8')).hexdigest()
+
+    try:
+        container = get_container(CONTAINER_LOGGED_USERS)
+        created_at = datetime.utcnow().isoformat() + 'Z'
+
+        user_doc = {
+            'id': user_id,
+            'email': encrypt_text(email),
+            'email_hash': email_hash,
+            'password_hash': encrypt_text(password_hash),
+            'name': encrypt_text(name) if name else None,
+            'is_verified': True,
+            'created_at': created_at,
+            'updated_at': created_at,
+        }
+
+        container.create_item(body=user_doc)
+        logger.info(f"User created with id: {user_id}")
+
+        
+        user = container.read_item(item=user_id, partition_key=user_id)
+        try:
+            if user and user.get('email'):
+                user['email'] = decrypt_text(user['email'])
+            if user and user.get('name'):
+                user['name'] = decrypt_text(user['name'])
+        except Exception:
+            logger.exception('Failed to decrypt user fields')
+        return user
+    except Exception as e:
+        logger.error(f"create_user error: {e}")
+        raise Exception(f"Failed to create user: {e}")
+
+
+def get_user_by_email(email: str) -> Optional[Dict]:
+    """Lookup user by email hash."""
+    check_db_available()
+    email_norm = (email or '').strip().lower()
+    email_hash = hashlib.sha256(email_norm.encode('utf-8')).hexdigest()
+
+    try:
+        container = get_container(CONTAINER_LOGGED_USERS)
+        query = "SELECT * FROM c WHERE c.email_hash = @email_hash"
+        parameters = [{"name": "@email_hash", "value": email_hash}]
+
+        items = container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        )
+        users = list(items)
+        if not users:
+            return None
+        user = users[0]
+        try:
+            if user.get('email'):
+                user['email'] = decrypt_text(user['email'])
+            if user.get('password_hash'):
+                user['password_hash'] = decrypt_text(user['password_hash'])
+            if user.get('name'):
+                user['name'] = decrypt_text(user['name'])
+        except Exception:
+            logger.exception('Failed to decrypt user fields')
+        return user
+    except Exception as e:
+        logger.error(f"get_user_by_email error: {e}")
+        raise Exception(f"Failed to get user: {e}")
