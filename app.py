@@ -82,7 +82,7 @@ FRONTEND_URL = os.getenv('FRONTEND_URL', 'https://victorious-pond-00c76f410.3.az
 
 
 ENV = os.getenv('ENV', 'development')
-COOKIE_SAMESITE = 'none'  
+COOKIE_SAMESITE = 'lax'  
 COOKIE_SECURE = True
 
 # Configure CORS origins based on environment
